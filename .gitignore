@@ -1,0 +1,20 @@
+# Compiled binaries -- rebuilt with the commands in the file headers.
+pathtracer
+pathtracer_cornell
+pathtracer_neon
+*.o
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Virtual environment (~1.6 GB of CUDA libraries from pip).
+# venv also writes its own self-excluding .gitignore, but be explicit.
+.venv/
+
+# HDR dumps from --save-hdr; large and re-renderable.
+*.pfm
+
+# Scratch renders
+.prev/
+.previews/
