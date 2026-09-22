@@ -5,6 +5,11 @@ Generate scene headers for pathtracer.c.
 Each header defines the sphere list plus any camera/sky/exposure overrides,
 and is compiled in with:  cc ... -DSCENE_FILE='"scene_cornell.h"' ...
 
+scene.h is the default scene and takes no overrides; it is transcribed
+straight out of pathtracer.py's build_scene() so that the NumPy and C
+renderers trace byte-identical geometry and the benchmark between them
+stays honest.
+
 Walls and floors are spheres of radius 1000 -- the smallpt trick. At this
 scale their curvature is under a millimetre across the room, and it keeps
 the renderer to a single primitive.
@@ -39,6 +44,42 @@ def emit(path, title, spheres, knobs):
         fh.write("\n".join(out))
     lights = sum(1 for s in spheres if s[3] == "EMISSIVE")
     print(f"{path}: {len(spheres)} spheres, {lights} lights")
+
+
+def hero():
+    """scene.h -- the default scene, lifted from pathtracer.py build_scene().
+
+    Emitted in that module's own layout (signed positions, unsigned
+    colours) so regenerating reproduces the committed file byte for byte.
+    """
+    import importlib.util, os
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    spec = importlib.util.spec_from_file_location(
+        "pathtracer_py", os.path.join(here, "pathtracer.py"))
+    pt = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(pt)
+    c, r, a, m, p = pt.build_scene()
+
+    names = {0: "LAMBERTIAN", 1: "METAL", 2: "DIELECTRIC", 3: "EMISSIVE"}
+    out = ["/* Generated from pathtracer.py build_scene() -- do not edit by hand.",
+           " * Both renderers trace byte-identical geometry so the benchmark is fair. */",
+           "#ifndef SCENE_H", "#define SCENE_H", "",
+           "typedef enum { LAMBERTIAN=0, METAL=1, DIELECTRIC=2, EMISSIVE=3 } Mat;", "",
+           "typedef struct { float cx, cy, cz, r; float ar, ag, ab; int mat; float param; } Sphere;",
+           "", f"#define N_SPHERES {len(r)}", "",
+           "static const Sphere SCENE[N_SPHERES] = {"]
+    for i in range(len(r)):
+        out.append(
+            "  {{ {:+.6f}f, {:+.6f}f, {:+.6f}f, {:+.6f}f, "
+            "{:.6f}f, {:.6f}f, {:.6f}f, {}, {:.6f}f }},".format(
+                c[i, 0], c[i, 1], c[i, 2], r[i],
+                a[i, 0], a[i, 1], a[i, 2], names[int(m[i])], p[i]))
+    out += ["};", "", "#endif"]
+    with open(os.path.join(here, "scene.h"), "w") as fh:
+        fh.write("\n".join(out) + "\n")
+    lights = int((m == 3).sum())
+    print(f"scene.h: {len(r)} spheres, {lights} lights")
 
 
 def cornell():
@@ -127,5 +168,6 @@ def neon():
 
 
 if __name__ == "__main__":
+    hero()
     cornell()
     neon()
