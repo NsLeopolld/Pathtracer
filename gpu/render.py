@@ -4,16 +4,13 @@ Host side of the GPU spectral path tracer: scene upload, adaptive sampling
 loop, post (glare -> exposure -> AgX -> dither -> PNG).
 """
 
-import argparse, importlib.util, os, sys, time
+import argparse, os, sys, time
 import numpy as np
 import cupy as cp
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import scenes as SC
-
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_spec = importlib.util.spec_from_file_location("pt", os.path.join(ROOT, "pathtracer.py"))
-PT = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(PT)
+from png import write_png
 
 
 # ----------------------------------------------------------------- module
@@ -177,7 +174,7 @@ def to_png(hdr, path, exposure=1.0, tonemap="agx", look="none", bloom=0.0):
     tri = (rng.random_sample(ldr.shape, dtype=cp.float32)
            - rng.random_sample(ldr.shape, dtype=cp.float32)) * 0.5
     out = cp.clip(ldr*255.0 + tri + 0.5, 0, 255).astype(cp.uint8)
-    return PT.write_png(path, cp.asnumpy(out))
+    return write_png(path, cp.asnumpy(out))
 
 
 def save_pfm(hdr, path):

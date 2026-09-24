@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Scene definitions for the GPU spectral path tracer."""
 
-import importlib.util
 import os
+import sys
 import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from make_scenes import build_scene
 
 DIFFUSE, CONDUCTOR, DIELECTRIC, PLASTIC, EMISSIVE, THINFILM = range(6)
 
@@ -91,11 +94,8 @@ class Scene:
 # ====================================================================== #
 
 def hero():
-    """Same layout as pathtracer.py, with the GPU materials."""
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    spec = importlib.util.spec_from_file_location("pt", os.path.join(root, "pathtracer.py"))
-    pt = importlib.util.module_from_spec(spec); spec.loader.exec_module(pt)
-    c, r, a, m, p = pt.build_scene()
+    """Same layout as scene.h, with the GPU materials."""
+    c, r, a, m, p = build_scene()
 
     s = Scene("hero")
     s.cam = dict(frm=(8.6, 2.15, 6.2), at=(0.0, 0.92, -0.2), vfov=27.0,

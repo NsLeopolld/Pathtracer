@@ -1,11 +1,10 @@
 /*
- * C port of pathtracer.py. Same scene (scene.h), camera and algorithm, so
- * the two can be benchmarked against each other.
+ * CPU path tracer. Spheres only, NEE toward sphere lights, Schlick glass,
+ * fuzzy metal, thin lens DOF, Russian roulette, ACES, own PNG writer.
  *
- * Main difference: the numpy version pushes all rays through one bounce at
- * a time, which streams the whole ray set through memory every bounce.
- * Here each path is traced start to finish. Sphere data is SoA so gcc can
- * vectorize the intersection loop (AVX2 with -march=native).
+ * One path at a time per thread (OpenMP). Sphere data is SoA and the
+ * intersection loop is written so gcc vectorizes it (AVX2 with
+ * -march=native). Scene comes from scene.h, see make_scenes.py.
  *
  *   cc -O3 -march=native -ffast-math -fopenmp pathtracer.c -lz -lm -o pathtracer
  */
@@ -110,8 +109,16 @@ static inline Vec3 random_unit(Rng *r) {
 
 /* ---- scene (SoA for the intersect loop) ---- */
 
-static float g_cx[N_SPHERES], g_cy[N_SPHERES], g_cz[N_SPHERES];
-static float g_r[N_SPHERES],  g_r2[N_SPHERES], g_inv_r[N_SPHERES];
+/* intersect() works on LANES spheres at a time, so the geometry arrays are
+ * padded up to a multiple of that with spheres nothing can hit. */
+#define LANES 8
+#define N_PAD (((N_SPHERES) + LANES - 1) / LANES * LANES)
+
+static float g_cx[N_PAD] __attribute__((aligned(32)));
+static float g_cy[N_PAD] __attribute__((aligned(32)));
+static float g_cz[N_PAD] __attribute__((aligned(32)));
+static float g_r2[N_PAD] __attribute__((aligned(32)));
+static float g_r[N_SPHERES], g_inv_r[N_SPHERES];
 static float g_ar[N_SPHERES], g_ag[N_SPHERES], g_ab[N_SPHERES];
 static int   g_mat[N_SPHERES];
 static float g_param[N_SPHERES];
@@ -128,27 +135,48 @@ static void scene_init(void) {
         g_power[i] = (0.2126f*s->ar + 0.7152f*s->ag + 0.0722f*s->ab) * s->r * s->r;
         if (s->mat == EMISSIVE) g_lights[g_nlights++] = i;
     }
+    /* r^2 = -1e30 makes disc hugely negative, so padding never hits */
+    for (int i = N_SPHERES; i < N_PAD; i++) {
+        g_cx[i] = g_cy[i] = g_cz[i] = 0.0f;
+        g_r2[i] = -1e30f;
+    }
 }
 
-/* Closest hit. Kept branchless so gcc vectorizes it (selects -> blends),
- * don't add early-outs here. */
+/* Closest hit. gcc won't vectorize a min-with-index reduction, so keep a
+ * separate best hit per lane and merge them at the end. The inner loop
+ * has to stay branchless or it stops vectorizing. */
 static inline int intersect(Vec3 o, Vec3 d, float tmin, float *out_t) {
-    float best = INFINITY;
-    int   id   = -1;
-    for (int i = 0; i < N_SPHERES; i++) {
-        float ox = o.x - g_cx[i], oy = o.y - g_cy[i], oz = o.z - g_cz[i];
-        float hb = d.x*ox + d.y*oy + d.z*oz;          /* |d| == 1 so a == 1 */
-        float c  = ox*ox + oy*oy + oz*oz - g_r2[i];
-        float disc = hb*hb - c;
-        float s  = sqrtf(disc > 0.0f ? disc : 0.0f);
-        float t0 = -hb - s, t1 = -hb + s;
-        float t  = (t0 > tmin) ? t0 : t1;
-        int ok = (disc > 0.0f) & (t > tmin) & (t < best);
-        best = ok ? t : best;
-        id   = ok ? i : id;
+    float best[LANES];
+    int   id[LANES];
+    for (int j = 0; j < LANES; j++) { best[j] = 1e30f; id[j] = -1; }
+
+    for (int i = 0; i < N_PAD; i += LANES) {
+        for (int j = 0; j < LANES; j++) {
+            int k = i + j;
+            float ox = o.x - g_cx[k], oy = o.y - g_cy[k], oz = o.z - g_cz[k];
+            float hb = d.x*ox + d.y*oy + d.z*oz;      /* |d| == 1 so a == 1 */
+            float c  = ox*ox + oy*oy + oz*oz - g_r2[k];
+            float disc = hb*hb - c;
+            float s  = sqrtf(disc > 0.0f ? disc : 0.0f);
+            float t0 = -hb - s, t1 = -hb + s;
+            float t  = (t0 > tmin) ? t0 : t1;
+            int ok = (disc > 0.0f) & (t > tmin) & (t < best[j]);
+            best[j] = ok ? t : best[j];
+            id[j]   = ok ? k : id[j];
+        }
     }
-    *out_t = best;
-    return id;
+
+    /* ties go to the lower index, same as a plain sequential scan */
+    float bt = best[0];
+    int   bi = id[0];
+    for (int j = 1; j < LANES; j++) {
+        if (id[j] >= 0 && (best[j] < bt || (best[j] == bt && (bi < 0 || id[j] < bi)))) {
+            bt = best[j];
+            bi = id[j];
+        }
+    }
+    *out_t = bt;
+    return bi;
 }
 
 static inline Vec3 sky(Vec3 d) {
@@ -310,7 +338,7 @@ static inline void camera_ray(float s, float t, Rng *rng, Vec3 *o, Vec3 *d) {
     *d = vnorm(vsub(target, *o));
 }
 
-/* ---- PNG writer (same as the python one) ---- */
+/* ---- PNG writer ---- */
 
 static void put_be32(unsigned char *p, uint32_t v) {
     p[0]=(unsigned char)(v>>24); p[1]=(unsigned char)(v>>16);
@@ -369,7 +397,6 @@ static size_t write_png(const char *path, const unsigned char *rgb, int w, int h
         prev = cur;
     }
 
-    /* same zlib settings as pathtracer.py */
     z_stream zs; memset(&zs, 0, sizeof zs);
     deflateInit2(&zs, 9, Z_DEFLATED, 15, 9, Z_FILTERED);
     size_t cap = deflateBound(&zs, raw_len);
