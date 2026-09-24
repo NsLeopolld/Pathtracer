@@ -25,13 +25,17 @@ gcc -O3 -march=native -ffast-math -funroll-loops -fopenmp -Wall -Wextra \
 Other scenes are picked at compile time:
 
 ```sh
-python3 make_scenes.py                      # writes scene.h, scene_cornell.h, scene_boxes.h, scene_neon.h
+python3 make_scenes.py                      # writes all the scene*.h headers
 gcc -O3 -march=native -ffast-math -fopenmp \
     -DSCENE_FILE='"scene_cornell.h"' pathtracer.c -lz -lm -o pathtracer_cornell
 ```
 
-Flags: `--width --height --spp --depth --out`. Thread count comes from
-`OMP_NUM_THREADS`.
+Scenes: `scene.h` (default), `scene_cornell.h`, `scene_boxes.h` (Cornell
+box with boxes), `scene_neon.h`, `scene_mirrors.h`, `scene_dominoes.h`,
+`scene_billiards.h`, `scene_gallery.h` and `scene_stairs.h`.
+
+Flags: `--width --height --spp --depth --out` (`--help` lists them).
+Thread count comes from `OMP_NUM_THREADS`.
 
 ### CUDA (spectral, needs an NVIDIA GPU)
 
@@ -42,8 +46,11 @@ Flags: `--width --height --spp --depth --out`. Thread count comes from
 ```
 
 Environment setup is [below](#setup-for-the-cuda-version). Scenes: `hero`,
-`cornell`, `cornell-boxes`, `neon`, and the test scenes `mistest`,
-`mistest-area` and `furnace-*`.
+`cornell`, `cornell-boxes`, `neon`, `mirrors`, `dominoes`, `billiards`,
+`gallery`, `stairs`, and the test scenes `mistest`, `mistest-area` and
+`furnace-*`. The newer scenes share their layouts with the C headers of the
+same name, with the GPU's extra materials (glossy plastic, rough metal,
+dispersive glass).
 
 ---
 

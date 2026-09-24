@@ -275,8 +275,196 @@ def neon():
     emit("scene_neon.h", "Neon night", s, knobs)
 
 
+def mirrors():
+    """Two facing mirrors: the balls between them repeat into the distance."""
+    planes = [((0, 1, 0), 0.0, (0.8, 0.8, 0.8), "LAMBERTIAN", 0)]   # checker floor
+    # Mirrors are thin boxes, not planes: two infinite planes would close
+    # off the sky (every ray that isn't exactly parallel hits one), and
+    # with no lamp the scene would be black. The slight green tint is what
+    # real mirrors do, and it makes each reflection a little darker.
+    glass = (0.80, 0.88, 0.84)
+    boxes = [
+        ((-2.0, 1.3, -1.0), (0.04, 2.6, 12.0), glass, "METAL", 0.0),
+        ((2.0, 1.3, -1.0), (0.04, 2.6, 12.0), glass, "METAL", 0.0),
+    ]
+    spheres = [
+        ((-0.9, 0.35, 1.0), 0.35, (1, 1, 1), "DIELECTRIC", 1.5),
+        ((0.3, 0.45, 0.2), 0.45, (0.75, 0.12, 0.1), "LAMBERTIAN", 0),
+        ((-0.5, 0.3, -0.8), 0.3, (1.0, 0.78, 0.34), "METAL", 0.02),
+        ((0.9, 0.25, -1.6), 0.25, (0.1, 0.3, 0.75), "LAMBERTIAN", 0),
+    ]
+    # lit by the sky only: a small lamp seen through the mirrors turns into
+    # thousands of fireflies on the floor, since NEE can't see it that way
+    knobs = {
+        "CAM_FROM": "1.5f, 1.4f, 4.8f",
+        "CAM_AT": "-1.0f, 0.5f, -0.6f",
+        "CAM_VFOV": "42.0f",
+        "CAM_APERTURE": "0.0f",
+        "SKY_HORIZON": "0.70f, 0.72f, 0.76f",
+        "SKY_ZENITH": "0.25f, 0.36f, 0.60f",
+        "FLOOR_CHECKER": "1",
+        "EXPOSURE": "1.0f",
+    }
+    emit("scene_mirrors.h", "Infinity mirrors", spheres, knobs, planes, boxes)
+
+
+def domino_path(n=16):
+    """Centres and rot_y (degrees) along an S-curve, evenly spaced along it."""
+    t = np.linspace(0.0, 1.0, 2001)
+    x = -2.4 + 4.8 * t
+    z = 0.9 * np.sin(t * 2 * np.pi)
+    arc = np.concatenate([[0.0], np.cumsum(np.hypot(np.diff(x), np.diff(z)))])
+    out = []
+    for d in np.linspace(0.0, arc[-1], n):
+        i = min(int(np.searchsorted(arc, d)), len(t) - 2)
+        dx, dz = x[i + 1] - x[i], z[i + 1] - z[i]
+        # a box's local z axis points along (sin a, cos a) in x/z for rot_y = a,
+        # so this turns the thin side of each domino along the path
+        out.append(((float(x[i]), float(z[i])), float(np.degrees(np.arctan2(dx, dz)))))
+    return out
+
+
+def dominoes():
+    """A line of dominoes along an S-curve, low warm light."""
+    planes = [((0, 1, 0), 0.0, (0.42, 0.27, 0.16), "LAMBERTIAN", 0)]   # wooden floor
+    boxes = [((x, 0.25, z), (0.25, 0.5, 0.07), (0.86, 0.85, 0.8), "LAMBERTIAN", 0, a)
+             for (x, z), a in domino_path()]
+    spheres = [
+        ((-2.9, 0.22, 0.15), 0.22, (0.75, 0.1, 0.08), "METAL", 0.1),     # the ball that starts it
+        ((4.5, 1.1, 3.0), 0.35, (110, 75, 40), "EMISSIVE", 0),          # low warm lamp
+    ]
+    knobs = {
+        "CAM_FROM": "0.8f, 2.6f, 5.2f",
+        "CAM_AT": "0.0f, 0.2f, 0.0f",
+        "CAM_VFOV": "38.0f",
+        "CAM_APERTURE": "0.06f",
+        "SKY_HORIZON": "0.10f, 0.09f, 0.10f",
+        "SKY_ZENITH": "0.03f, 0.04f, 0.07f",
+        "FLOOR_CHECKER": "0",
+        "EXPOSURE": "1.0f",
+    }
+    emit("scene_dominoes.h", "Dominoes", spheres, knobs, planes, boxes)
+
+
+BALL_COLOURS = [(0.85, 0.65, 0.05), (0.05, 0.15, 0.6), (0.7, 0.05, 0.05), (0.3, 0.05, 0.4),
+                (0.85, 0.3, 0.02), (0.05, 0.35, 0.1), (0.4, 0.07, 0.05), (0.02, 0.02, 0.02)]
+
+
+def billiard_rack(r=0.1, apex_z=-0.4):
+    """15 ball centres in a triangle, apex toward the camera (+z)."""
+    balls, k = [], 0
+    for row in range(5):
+        z = apex_z - row * r * np.sqrt(3.0) * 1.001
+        for j in range(row + 1):
+            x = (j - row / 2) * 2 * r * 1.001
+            balls.append(((float(x), r, float(z)), BALL_COLOURS[k % len(BALL_COLOURS)]))
+            k += 1
+    return balls
+
+
+def billiards():
+    """Racked balls on a felt table under two lamps."""
+    planes = [((0, 1, 0), -0.9, (0.12, 0.08, 0.06), "LAMBERTIAN", 0)]  # room floor, y = -0.9
+    wood = (0.35, 0.16, 0.07)
+    boxes = [
+        ((0, -0.05, 0), (4.0, 0.1, 2.2), (0.06, 0.32, 0.12), "LAMBERTIAN", 0),    # felt top, y = 0
+        ((0, -0.5, 0), (3.6, 0.8, 1.8), (0.1, 0.06, 0.04), "LAMBERTIAN", 0),      # table body
+        ((0, 0.04, -1.16), (4.3, 0.18, 0.12), wood, "LAMBERTIAN", 0),             # rails
+        ((0, 0.04, 1.16), (4.3, 0.18, 0.12), wood, "LAMBERTIAN", 0),
+        ((-2.06, 0.04, 0), (0.12, 0.18, 2.2), wood, "LAMBERTIAN", 0),
+        ((2.06, 0.04, 0), (0.12, 0.18, 2.2), wood, "LAMBERTIAN", 0),
+    ]
+    spheres = [(c, 0.1, col, "LAMBERTIAN", 0) for c, col in billiard_rack()]
+    spheres += [
+        ((0.35, 0.1, 1.0), 0.1, (0.9, 0.88, 0.82), "LAMBERTIAN", 0),     # cue ball
+        ((-0.9, 1.9, 0), 0.22, (22, 19, 14), "EMISSIVE", 0),             # lamps
+        ((0.9, 1.9, 0), 0.22, (22, 19, 14), "EMISSIVE", 0),
+    ]
+    knobs = {
+        "CAM_FROM": "1.1f, 0.75f, 2.7f",
+        "CAM_AT": "0.0f, 0.08f, -0.5f",
+        "CAM_VFOV": "32.0f",
+        "CAM_APERTURE": "0.02f",
+        "SKY_HORIZON": "0.0f, 0.0f, 0.0f",
+        "SKY_ZENITH": "0.0f, 0.0f, 0.0f",
+        "FLOOR_CHECKER": "0",
+        "EXPOSURE": "1.0f",
+    }
+    emit("scene_billiards.h", "Billiards", spheres, knobs, planes, boxes)
+
+
+def gallery():
+    """Three pedestals: glass, gold and a mirror cube."""
+    planes = [
+        ((0, 1, 0), 0.0, (0.8, 0.8, 0.8), "LAMBERTIAN", 0),           # checker floor
+        ((0, 0, 1), -2.5, (0.78, 0.76, 0.72), "LAMBERTIAN", 0),       # back wall, z = -2.5
+    ]
+    white = (0.8, 0.79, 0.76)
+    boxes = [((x, 0.5, -1.0), (0.6, 1.0, 0.6), white, "LAMBERTIAN", 0) for x in (-1.6, 0.0, 1.6)]
+    boxes.append(((1.6, 1.25, -1.0), (0.5, 0.5, 0.5), (0.95, 0.95, 0.97), "METAL", 0.0, 40.0))
+    spheres = [
+        ((-1.6, 1.3, -1.0), 0.3, (1, 1, 1), "DIELECTRIC", 1.5),
+        ((0.0, 1.3, -1.0), 0.3, (1.0, 0.78, 0.34), "METAL", 0.08),
+    ]
+    # big and dim rather than small and bright: same light, far fewer fireflies
+    # from the lamps' reflections in the gold and the mirror cube
+    spheres += [((x, 3.2, 0.4), 0.45, (5.0, 4.6, 3.8), "EMISSIVE", 0) for x in (-1.6, 0.0, 1.6)]
+    knobs = {
+        "CAM_FROM": "0.0f, 1.6f, 5.0f",
+        "CAM_AT": "0.0f, 1.0f, -1.0f",
+        "CAM_VFOV": "36.0f",
+        "CAM_APERTURE": "0.0f",
+        "SKY_HORIZON": "0.05f, 0.05f, 0.06f",
+        "SKY_ZENITH": "0.02f, 0.02f, 0.03f",
+        "FLOOR_CHECKER": "1",
+        "EXPOSURE": "1.0f",
+    }
+    emit("scene_gallery.h", "Gallery", spheres, knobs, planes, boxes)
+
+
+def stairs_steps(n=14):
+    """Spiral steps: (centre, rot_y) with each step pointing out from the column."""
+    out = []
+    for i in range(n):
+        a = np.radians(28.0 * i)
+        # rot_y = a turns the box's local x axis to (cos a, -sin a) in x/z
+        centre = (float(0.75 * np.cos(a)), 0.15 + 0.2 * i, float(-0.75 * np.sin(a)))
+        out.append((centre, float(np.degrees(a))))
+    return out
+
+
+def stairs():
+    """Spiral staircase around a column, sunset sky."""
+    planes = [((0, 1, 0), 0.0, (0.8, 0.8, 0.8), "LAMBERTIAN", 0)]      # checker floor
+    stone = (0.75, 0.72, 0.66)
+    boxes = [((0, 1.6, 0), (0.35, 3.2, 0.35), stone, "LAMBERTIAN", 0)]  # column
+    boxes += [(c, (1.1, 0.07, 0.38), stone, "LAMBERTIAN", 0, a) for c, a in stairs_steps()]
+    top_c, top_a = stairs_steps()[-1]
+    spheres = [
+        ((top_c[0] * 1.25, top_c[1] + 0.035 + 0.14, top_c[2] * 1.25), 0.14, (1, 1, 1), "DIELECTRIC", 1.5),
+        ((1.4, 0.2, 0.9), 0.2, (0.7, 0.12, 0.08), "LAMBERTIAN", 0),
+        ((6.0, 6.0, 4.0), 0.8, (30, 22, 14), "EMISSIVE", 0),               # evening sun
+    ]
+    knobs = {
+        "CAM_FROM": "3.6f, 2.0f, 4.6f",
+        "CAM_AT": "0.0f, 1.3f, 0.0f",
+        "CAM_VFOV": "42.0f",
+        "CAM_APERTURE": "0.0f",
+        "SKY_HORIZON": "0.55f, 0.35f, 0.25f",
+        "SKY_ZENITH": "0.12f, 0.16f, 0.30f",
+        "FLOOR_CHECKER": "1",
+        "EXPOSURE": "0.9f",
+    }
+    emit("scene_stairs.h", "Spiral stairs", spheres, knobs, planes, boxes)
+
+
 if __name__ == "__main__":
     hero()
     cornell()
     cornell_boxes()
     neon()
+    mirrors()
+    dominoes()
+    billiards()
+    gallery()
+    stairs()
