@@ -52,7 +52,13 @@ __constant__ int          c_light[MAXLI];  // indices of emissive spheres
 __constant__ float        c_lpow[MAXLI];   // luminance * r^2
 __constant__ float4       c_box[2*MAXB];   // (centre.xyz, cos rot_y), (half size.xyz, sin rot_y)
 __constant__ int          c_bmat[MAXB];
-__constant__ int          c_cnt[4];        // nsph, npln, nlight, nbox
+__constant__ int          c_cnt[8];        // nsph, npln, nlight, nbox, ntri, nnode
+// triangle meshes live in global memory (too big for constant memory);
+// render.py stores the device pointers here. Layout matches meshes.pack().
+__constant__ const float4* c_tri;          // 3 per tri: (v0, 0), (e1, 0), (e2, 0)
+__constant__ const float4* c_tnrm;         // 3 per tri: vertex normals
+__constant__ const int*    c_tmat;         // material per tri
+__constant__ const float4* c_bvh;          // 2 per node: (bmin, a), (bmax, count), ints as bits
 __constant__ float        c_cam[20];
 __constant__ float        c_sky[8];
 __constant__ unsigned int c_sobol[4][32];
@@ -193,7 +199,8 @@ __device__ __forceinline__ float4 sample4(Sampler &s, unsigned int group) {
 #define K_SPHERE 0
 #define K_PLANE  1
 #define K_BOX    2
-struct Hit { float t; int prim; int kind; };
+#define K_TRI    3
+struct Hit { float t; int prim; int kind; float u, v; };   // u, v: barycentrics on a triangle
 
 // world -> box frame is a rotation by -rot_y around y
 __device__ __forceinline__ V3 box_to_local(int i, V3 v) {
@@ -232,6 +239,71 @@ __device__ V3 box_normal(int i, V3 p) {
     return v3(c*n.x + s*n.z, n.y, -s*n.x + c*n.z);
 }
 
+// ---- triangle meshes: BVH from meshes.py, node layout documented there
+// Moller-Trumbore; 1e30 on a miss
+__device__ __forceinline__ float tri_hit(int i, V3 o, V3 d, float tmin, float tmax,
+                                         float &u, float &v) {
+    float4 a = c_tri[3*i], b = c_tri[3*i+1], c = c_tri[3*i+2];
+    V3 e1 = v3(b.x, b.y, b.z), e2 = v3(c.x, c.y, c.z);
+    V3 pv = cross3(d, e2);
+    float det = dot3(e1, pv);
+    if (fabsf(det) < 1e-12f) return 1e30f;
+    float inv = 1.0f / det;
+    V3 tv = sub(o, v3(a.x, a.y, a.z));
+    float uu = dot3(tv, pv) * inv;
+    if (uu < 0.0f || uu > 1.0f) return 1e30f;
+    V3 qv = cross3(tv, e1);
+    float vv = dot3(d, qv) * inv;
+    if (vv < 0.0f || uu + vv > 1.0f) return 1e30f;
+    float t = dot3(e2, qv) * inv;
+    if (t <= tmin || t >= tmax) return 1e30f;
+    u = uu; v = vv;
+    return t;
+}
+
+__device__ __forceinline__ float node_enter(int i, V3 o, V3 inv, float tmin, float tmax) {
+    float4 a = c_bvh[2*i], b = c_bvh[2*i+1];
+    float tx1 = (a.x - o.x)*inv.x, tx2 = (b.x - o.x)*inv.x;
+    float ty1 = (a.y - o.y)*inv.y, ty2 = (b.y - o.y)*inv.y;
+    float tz1 = (a.z - o.z)*inv.z, tz2 = (b.z - o.z)*inv.z;
+    tmin = fmaxf(tmin, fmaxf(fminf(tx1, tx2), fmaxf(fminf(ty1, ty2), fminf(tz1, tz2))));
+    tmax = fminf(tmax, fminf(fmaxf(tx1, tx2), fminf(fmaxf(ty1, ty2), fmaxf(tz1, tz2))));
+    return tmin <= tmax ? tmin : 1e30f;
+}
+
+// closest triangle nearer than tmax, near child first; -1 if none
+__device__ int bvh_hit(V3 o, V3 d, float tmin, float &tmax, float &u, float &v) {
+    V3 inv = v3(1.0f / (fabsf(d.x) > 1e-12f ? d.x : copysignf(1e-12f, d.x)),
+                1.0f / (fabsf(d.y) > 1e-12f ? d.y : copysignf(1e-12f, d.y)),
+                1.0f / (fabsf(d.z) > 1e-12f ? d.z : copysignf(1e-12f, d.z)));
+    if (node_enter(0, o, inv, tmin, tmax) >= 1e30f) return -1;
+    int stack[48]; float stack_t[48];            // meshes.py trees stay far shallower
+    int sp = 0, node = 0, hit = -1;
+    for (;;) {
+        float4 b = c_bvh[2*node + 1];
+        int count = __float_as_int(b.w), a = __float_as_int(c_bvh[2*node].w);
+        if (count > 0) {
+            for (int k = 0; k < count; k++) {
+                float uu, vv, t = tri_hit(a + k, o, d, tmin, tmax, uu, vv);
+                if (t < tmax) { tmax = t; hit = a + k; u = uu; v = vv; }
+            }
+        } else {
+            int l = node + 1, r = a;
+            float tl = node_enter(l, o, inv, tmin, tmax), tr = node_enter(r, o, inv, tmin, tmax);
+            if (tr < tl) { int ti = l; l = r; r = ti; float tf = tl; tl = tr; tr = tf; }
+            if (tl < 1e30f) {
+                if (tr < 1e30f) { stack[sp] = r; stack_t[sp++] = tr; }
+                node = l;
+                continue;
+            }
+        }
+        do {
+            if (sp == 0) return hit;
+            node = stack[--sp];
+        } while (stack_t[sp] >= tmax);
+    }
+}
+
 __device__ bool intersect(V3 o, V3 d, float tmin, Hit &h) {
     float best = 1e30f; int id = -1, kind = K_SPHERE;
     int ns = c_cnt[0];
@@ -267,6 +339,12 @@ __device__ bool intersect(V3 o, V3 d, float tmin, Hit &h) {
         id   = ok ? i : id;
         kind = ok ? K_BOX : kind;
     }
+    h.u = h.v = 0.0f;
+    if (c_cnt[4] > 0) {
+        float u, v;
+        int tri = bvh_hit(o, d, tmin, best, u, v);   // best shrinks on a hit
+        if (tri >= 0) { id = tri; kind = K_TRI; h.u = u; h.v = v; }
+    }
     h.t = best; h.prim = id; h.kind = kind;
     return id >= 0;
 }
@@ -274,6 +352,7 @@ __device__ bool intersect(V3 o, V3 d, float tmin, Hit &h) {
 __device__ __forceinline__ int mat_of(const Hit &h) {
     return h.kind == K_PLANE ? c_pmat[h.prim]
          : h.kind == K_BOX   ? c_bmat[h.prim]
+         : h.kind == K_TRI   ? c_tmat[h.prim]
          :                     c_smat[h.prim];
 }
 
@@ -281,6 +360,10 @@ __device__ __forceinline__ int mat_of(const Hit &h) {
 __device__ V3 hit_normal(const Hit &h, V3 p) {
     if (h.kind == K_PLANE) return v3(c_pln[h.prim].x, c_pln[h.prim].y, c_pln[h.prim].z);
     if (h.kind == K_BOX)   return box_normal(h.prim, p);
+    if (h.kind == K_TRI) {
+        float4 b = c_tri[3*h.prim+1], c = c_tri[3*h.prim+2];
+        return norm3(cross3(v3(b.x, b.y, b.z), v3(c.x, c.y, c.z)));
+    }
     float4 sp4 = c_sph[h.prim];
     return norm3(mul(sub(p, v3(sp4.x, sp4.y, sp4.z)), 1.0f/sp4.w));
 }
@@ -635,9 +718,19 @@ extern "C" __global__ void render(
                 break;
             }
             V3 p = add(o, mul(d, h.t));
-            V3 ng = hit_normal(h, p);
+            V3 ng = hit_normal(h, p);            // true normal: sides and offsets
             int front = dot3(d, ng) < 0.0f;
             V3 fn = front ? ng : neg(ng);
+            // shading normal: interpolated on meshes, else the same as fn
+            V3 sn = fn;
+            if (h.kind == K_TRI) {
+                float4 n0 = c_tnrm[3*h.prim], n1 = c_tnrm[3*h.prim+1], n2 = c_tnrm[3*h.prim+2];
+                float w = 1.0f - h.u - h.v;
+                sn = norm3(v3(w*n0.x + h.u*n1.x + h.v*n2.x,
+                              w*n0.y + h.u*n1.y + h.v*n2.y,
+                              w*n0.z + h.u*n1.z + h.v*n2.z));
+                if (dot3(sn, fn) < 0.0f) sn = neg(sn);
+            }
 
             const Material m = mats[mat_of(h)];
 
@@ -681,15 +774,15 @@ extern "C" __global__ void render(
                 }
                 float n_lam = cauchy_ior(m.ior, m.abbe, sc.lam[0]);
                 float eta = front ? n_lam : 1.0f/n_lam;
-                float ci = fminf(dot3(neg(d), fn), 1.0f);
+                float ci = fminf(dot3(neg(d), sn), 1.0f);
                 float F = fresnel_dielectric(ci, eta);
                 float uu = rnd(smp);
                 if (uu < F) {
-                    nd = add(d, mul(fn, 2.0f*ci));
+                    nd = add(d, mul(sn, 2.0f*ci));
                 } else {
                     float s2t = (1.0f - ci*ci)/(eta*eta);
                     float ct = sqrtf(fmaxf(0.0f, 1.0f - s2t));
-                    nd = add(mul(add(d, mul(fn, ci)), 1.0f/eta), mul(fn, -ct));
+                    nd = add(mul(add(d, mul(sn, ci)), 1.0f/eta), mul(sn, -ct));
                 }
                 nd = norm3(nd);
                 prev_delta = 1; prev_pdf = 1.0f; prev_p = p;
@@ -698,7 +791,7 @@ extern "C" __global__ void render(
                 continue;
             }
             if (m.type == M_THINFILM) {
-                float ci = fminf(dot3(neg(d), fn), 1.0f);
+                float ci = fminf(dot3(neg(d), sn), 1.0f);
                 // thickness varies over spheres (drains to the top); flat elsewhere
                 float th = h.kind == K_SPHERE ? film_thickness(p, h.prim, m.film) : m.film;
                 Spec R;
@@ -714,7 +807,7 @@ extern "C" __global__ void render(
                 if (rnd(smp) < Pr) {
 #pragma unroll
                     for (int i=0;i<NL;i++) T.v[i] *= R.v[i]/Pr;
-                    nd = add(d, mul(fn, 2.0f*ci));
+                    nd = add(d, mul(sn, 2.0f*ci));
                     nd = norm3(nd);
                 } else {
 #pragma unroll
@@ -729,8 +822,8 @@ extern "C" __global__ void render(
             }
 
             // ---- non-delta: NEE + BSDF sampling with MIS -----------------
-            V3 tt, bb; onb(fn, tt, bb);
-            V3 wo = to_local(neg(d), tt, bb, fn);
+            V3 tt, bb; onb(sn, tt, bb);
+            V3 wo = to_local(neg(d), tt, bb, sn);
             if (wo.z <= 0.0f) break;
             float alpha = fmaxf(m.rough, (m.type == M_PLASTIC) ? 0.02f : 0.0f);
 
@@ -757,7 +850,7 @@ extern "C" __global__ void render(
                         onb(wl, lt, lb2);
                         V3 ldir = add(add(mul(lt, __cosf(ph)*st), mul(lb2, __sinf(ph)*st)),
                                       mul(wl, ct));
-                        V3 wi = to_local(ldir, tt, bb, fn);
+                        V3 wi = to_local(ldir, tt, bb, sn);
                         if (wi.z > 0.0f) {
                             float bpdf;
                             Spec fc = bsdf_eval(m.type, alb, alpha, m.ior, wo, wi, bpdf);
@@ -785,7 +878,10 @@ extern "C" __global__ void render(
             if (!bsdf_sample(m.type, alb, alpha, m.ior, wo, gA.x, gA.y, gA.z, bs)) break;
             T = sp_mul(T, bs.w);
             prev_delta = bs.delta; prev_pdf = bs.pdf; prev_p = p;
-            nd = to_world(bs.wi, tt, bb, fn);
+            nd = to_world(bs.wi, tt, bb, sn);
+            // a smoothed normal can send the bounce below the real surface,
+            // where it would leak into the mesh; drop those paths
+            if (h.kind == K_TRI && dot3(nd, fn) <= 0.0f) break;
             o = add(p, mul(fn, RAY_EPS));
             d = nd;
 

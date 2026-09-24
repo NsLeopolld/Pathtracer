@@ -1,7 +1,7 @@
 /*
- * CPU path tracer. Spheres, planes and boxes (rotatable around y). NEE
- * toward sphere lights, Schlick glass, fuzzy metal, thin lens DOF, Russian
- * roulette, ACES, own PNG writer.
+ * CPU path tracer. Spheres, planes, boxes (rotatable around y) and
+ * triangle meshes with a BVH. NEE toward sphere lights, Schlick glass,
+ * fuzzy metal, thin lens DOF, Russian roulette, ACES, own PNG writer.
  *
  * One path at a time per thread (OpenMP). Sphere data is SoA and the
  * intersection loop is written so gcc vectorizes it (AVX2 with
@@ -27,6 +27,7 @@ typedef struct { float cx, cy, cz, r; float ar, ag, ab; int mat; float param; } 
 typedef struct { float nx, ny, nz, d; float ar, ag, ab; int mat; float param; } Plane; /* n.p = d */
 typedef struct { float cx, cy, cz, sx, sy, sz, rot_y;   /* centre, full size, degrees */
                  float ar, ag, ab; int mat; float param; } Box;
+typedef struct { float ar, ag, ab; int mat; float param; } MeshMat;  /* triangles live in MESH_FILE */
 
 #ifndef SCENE_FILE
 #define SCENE_FILE "scene.h"
@@ -39,12 +40,17 @@ typedef struct { float cx, cy, cz, sx, sy, sz, rot_y;   /* centre, full size, de
 #ifndef N_BOXES
 #define N_BOXES 0
 #endif
+#ifndef N_MESH_MATS
+#define N_MESH_MATS 0
+#endif
 
 /* Every object gets one id for material lookups: planes first, then
- * spheres, then boxes. With no planes a sphere's id is its index. */
-#define N_OBJ     (N_PLANES + N_SPHERES + N_BOXES)
-#define SPH_ID(i) (N_PLANES + (i))
-#define BOX_ID(i) (N_PLANES + N_SPHERES + (i))
+ * spheres, then boxes, then one per mesh material. With no planes a
+ * sphere's id is its index. */
+#define N_OBJ      (N_PLANES + N_SPHERES + N_BOXES + N_MESH_MATS)
+#define SPH_ID(i)  (N_PLANES + (i))
+#define BOX_ID(i)  (N_PLANES + N_SPHERES + (i))
+#define MESH_ID(i) (N_PLANES + N_SPHERES + N_BOXES + (i))
 #define ARR(n)    ((n) > 0 ? (n) : 1)      /* avoid zero-length arrays */
 
 /* defaults, scene headers can override any of these */
@@ -190,6 +196,12 @@ static void scene_init(void) {
         set_mat(i, pl->ar, pl->ag, pl->ab, pl->mat, pl->param);
     }
 #endif
+#if N_MESH_MATS > 0
+    for (int i = 0; i < N_MESH_MATS; i++) {
+        const MeshMat *m = &MESH_MATS[i];
+        set_mat(MESH_ID(i), m->ar, m->ag, m->ab, m->mat, m->param);
+    }
+#endif
 #if N_BOXES > 0
     for (int i = 0; i < N_BOXES; i++) {
         const Box *b = &BOXES[i];
@@ -243,10 +255,134 @@ static inline Vec3 box_normal(int b, Vec3 p) {
 }
 #endif
 
+/* hit details only meshes need: which triangle, and where on it */
+typedef struct { int tri; float u, v; } TriHit;
+
+#ifdef MESH_FILE
+/* ---- triangle meshes, stored in a BVH built by meshes.py ---- */
+
+typedef struct { float bmin[3]; int a; float bmax[3]; int count; } BvhNode;  /* see meshes.py */
+
+static float   *g_tv;     /* per triangle: v0, e1 = v1 - v0, e2 = v2 - v0 */
+static float   *g_tn;     /* per triangle: the 3 vertex normals */
+static int     *g_tm;     /* per triangle: index into MESH_MATS */
+static BvhNode *g_bvh;
+static uint32_t g_ntri, g_nnode;
+
+static void *mesh_read(FILE *f, size_t count, size_t size) {
+    void *buf = malloc(count * size);
+    if (!buf || fread(buf, size, count, f) != count) {
+        fprintf(stderr, "%s: truncated file, re-run make_scenes.py\n", MESH_FILE);
+        exit(1);
+    }
+    return buf;
+}
+
+/* The file is little endian, like every machine this runs on. */
+static void mesh_load(void) {
+    FILE *f = fopen(MESH_FILE, "rb");
+    if (!f) {
+        fprintf(stderr, "can't open %s: run from the directory make_scenes.py wrote it to\n", MESH_FILE);
+        exit(1);
+    }
+    char magic[8];
+    uint32_t n[2];
+    if (fread(magic, 1, 8, f) != 8 || memcmp(magic, "PTMESH1", 8) != 0 || fread(n, 4, 2, f) != 2) {
+        fprintf(stderr, "%s: not a mesh file from meshes.py\n", MESH_FILE);
+        exit(1);
+    }
+    g_ntri = n[0]; g_nnode = n[1];
+    g_tv  = mesh_read(f, (size_t)g_ntri * 9, sizeof(float));
+    g_tn  = mesh_read(f, (size_t)g_ntri * 9, sizeof(float));
+    g_tm  = mesh_read(f, g_ntri, sizeof(int));
+    g_bvh = mesh_read(f, g_nnode, sizeof(BvhNode));
+    fclose(f);
+    for (uint32_t i = 0; i < g_ntri; i++)
+        if (g_tm[i] < 0 || g_tm[i] >= N_MESH_MATS) {
+            fprintf(stderr, "%s doesn't match the scene header, re-run make_scenes.py\n", MESH_FILE);
+            exit(1);
+        }
+}
+
+/* Moller-Trumbore. 1e30 on a miss, else t with barycentrics u, v. */
+static inline float tri_hit(int i, Vec3 o, Vec3 d, float tmin, float tmax, float *u, float *v) {
+    const float *t = g_tv + 9 * (size_t)i;
+    Vec3 e1 = v3(t[3], t[4], t[5]), e2 = v3(t[6], t[7], t[8]);
+    Vec3 pv = vcross(d, e2);
+    float det = vdot(e1, pv);
+    if (fabsf(det) < 1e-12f) return 1e30f;           /* ray parallel to the triangle */
+    float inv = 1.0f / det;
+    Vec3 tv = vsub(o, v3(t[0], t[1], t[2]));
+    float uu = vdot(tv, pv) * inv;
+    if (uu < 0.0f || uu > 1.0f) return 1e30f;
+    Vec3 qv = vcross(tv, e1);
+    float vv = vdot(d, qv) * inv;
+    if (vv < 0.0f || uu + vv > 1.0f) return 1e30f;
+    float tt = vdot(e2, qv) * inv;
+    if (tt <= tmin || tt >= tmax) return 1e30f;
+    *u = uu; *v = vv;
+    return tt;
+}
+
+/* entry distance into a node's box, or 1e30 if the ray misses it in [tmin, tmax] */
+static inline float node_enter(const BvhNode *nd, const float *o, const float *inv,
+                               float tmin, float tmax) {
+    for (int a = 0; a < 3; a++) {
+        float t1 = (nd->bmin[a] - o[a]) * inv[a], t2 = (nd->bmax[a] - o[a]) * inv[a];
+        tmin = fmaxf(tmin, fminf(t1, t2));
+        tmax = fminf(tmax, fmaxf(t1, t2));
+    }
+    return tmin <= tmax ? tmin : 1e30f;
+}
+
+/* Closest triangle nearer than tmax: walk the tree near child first and skip
+ * anything whose box starts beyond the best hit so far. */
+static int bvh_hit(Vec3 o, Vec3 d, float tmin, float tmax, float *out_t, TriHit *th) {
+    float org[3] = { o.x, o.y, o.z }, dd[3] = { d.x, d.y, d.z }, inv[3];
+    for (int a = 0; a < 3; a++)   /* keep 1/d finite: -ffast-math assumes no infinities */
+        inv[a] = 1.0f / (fabsf(dd[a]) > 1e-12f ? dd[a] : copysignf(1e-12f, dd[a]));
+    int stack[64]; float stack_t[64];   /* meshes.py trees are far shallower than 64 */
+    int sp = 0, node = 0, hit = -1;
+    if (node_enter(&g_bvh[0], org, inv, tmin, tmax) >= 1e30f) return -1;
+    for (;;) {
+        const BvhNode *nd = &g_bvh[node];
+        if (nd->count > 0) {
+            for (int k = 0; k < nd->count; k++) {
+                float u, v, t = tri_hit(nd->a + k, o, d, tmin, tmax, &u, &v);
+                if (t < tmax) { tmax = t; hit = nd->a + k; th->u = u; th->v = v; }
+            }
+        } else {
+            int l = node + 1, r = nd->a;
+            float tl = node_enter(&g_bvh[l], org, inv, tmin, tmax);
+            float tr = node_enter(&g_bvh[r], org, inv, tmin, tmax);
+            if (tr < tl) { int ti = l; l = r; r = ti; float tf = tl; tl = tr; tr = tf; }
+            if (tl < 1e30f) {
+                if (tr < 1e30f) { stack[sp] = r; stack_t[sp++] = tr; }
+                node = l;
+                continue;
+            }
+        }
+        /* pop the next node that could still hold something closer */
+        do {
+            if (sp == 0) { th->tri = hit; *out_t = tmax; return hit; }
+            node = stack[--sp];
+        } while (stack_t[sp] >= tmax);
+    }
+}
+
+static inline Vec3 mesh_shading_normal(const TriHit *th) {
+    const float *n = g_tn + 9 * (size_t)th->tri;
+    float w = 1.0f - th->u - th->v;
+    return vnorm(v3(w*n[0] + th->u*n[3] + th->v*n[6],
+                    w*n[1] + th->u*n[4] + th->v*n[7],
+                    w*n[2] + th->u*n[5] + th->v*n[8]));
+}
+#endif
+
 /* Closest hit, returns an object id. gcc won't vectorize a min-with-index reduction, so keep a
  * separate best hit per lane and merge them at the end. The inner loop
  * has to stay branchless or it stops vectorizing. */
-static inline int intersect(Vec3 o, Vec3 d, float tmin, float *out_t) {
+static inline int intersect(Vec3 o, Vec3 d, float tmin, float *out_t, TriHit *th) {
     float best[LANES];
     int   id[LANES];
     for (int j = 0; j < LANES; j++) { best[j] = 1e30f; id[j] = -1; }
@@ -293,11 +429,34 @@ static inline int intersect(Vec3 o, Vec3 d, float tmin, float *out_t) {
         if (t < bt) { bt = t; hit = BOX_ID(i); }
     }
 #endif
+#ifdef MESH_FILE
+    {
+        TriHit tmp;
+        float mt;
+        int tri = bvh_hit(o, d, tmin, bt, &mt, &tmp);
+        if (tri >= 0) {
+            bt = mt;
+            hit = MESH_ID(g_tm[tri]);
+            if (th) *th = tmp;
+        }
+    }
+#else
+    (void)th;
+#endif
     *out_t = bt;
     return hit;
 }
 
-static inline Vec3 normal_at(int id, Vec3 p) {
+/* true geometric normal (not the smoothed one for meshes) */
+static inline Vec3 normal_at(int id, Vec3 p, const TriHit *th) {
+#ifdef MESH_FILE
+    if (id >= MESH_ID(0)) {
+        const float *t = g_tv + 9 * (size_t)th->tri;
+        return vnorm(vcross(v3(t[3], t[4], t[5]), v3(t[6], t[7], t[8])));
+    }
+#else
+    (void)th;
+#endif
 #if N_PLANES > 0
     if (id < N_PLANES) return g_pn[id];
 #endif
@@ -327,7 +486,8 @@ static inline Vec3 checker(Vec3 p) {
  * subtends: pdf = 1 / (2*pi*(1 - cos_max)). With uniform picking a dim
  * light far away got as many shadow rays as a bright one close by. */
 
-static Vec3 sample_lights(Vec3 p, Vec3 n, Vec3 albedo, Rng *rng) {
+/* n: geometric normal (ray offset), sn: shading normal (cosine term) */
+static Vec3 sample_lights(Vec3 p, Vec3 n, Vec3 sn, Vec3 albedo, Rng *rng) {
     const Vec3 zero = v3(0.0f, 0.0f, 0.0f);
     int nl = g_nlights;
     if (nl == 0) return zero;
@@ -361,13 +521,13 @@ static Vec3 sample_lights(Vec3 p, Vec3 n, Vec3 albedo, Rng *rng) {
     Vec3 u = vcross(w, v);
     Vec3 ldir = vadd(vadd(vscl(u, cosf(phi)*st), vscl(v, sinf(phi)*st)), vscl(w, ct));
 
-    float cs = vdot(ldir, n);
+    float cs = vdot(ldir, sn);
     if (cs <= 1e-6f) return zero;
 
     /* visible iff the first hit is the light we picked */
     float t;
     Vec3 org = vadd(p, vscl(n, RAY_EPS));
-    if (intersect(org, ldir, 1e-4f, &t) != SPH_ID(li)) return zero;
+    if (intersect(org, ldir, 1e-4f, &t, NULL) != SPH_ID(li)) return zero;
 
     float pdf = 1.0f / (2.0f * PI * fmaxf(1.0f - cos_max, 1e-9f));
     float wgt = cs / (PI * pdf * pick_pdf);            /* brdf = alb/pi */
@@ -383,13 +543,23 @@ static Vec3 trace(Vec3 o, Vec3 d, Rng *rng, int max_depth) {
 
     for (int depth = 0; depth < max_depth; depth++) {
         float t;
-        int id = intersect(o, d, 1e-4f, &t);
+        TriHit th;
+        int id = intersect(o, d, 1e-4f, &t, &th);
         if (id < 0) { L = vadd(L, vmul(T, sky(d))); break; }
 
         Vec3 p = vadd(o, vscl(d, t));
-        Vec3 nrm = normal_at(id, p);
+        Vec3 nrm = normal_at(id, p, &th);
         int front = vdot(d, nrm) < 0.0f;
         Vec3 fn = front ? nrm : vneg(nrm);
+        /* sn shades, fn decides sides and offsets; they differ only on meshes */
+        Vec3 sn = fn;
+#ifdef MESH_FILE
+        int is_mesh = id >= MESH_ID(0);
+        if (is_mesh) {
+            sn = mesh_shading_normal(&th);
+            if (vdot(sn, fn) < 0.0f) sn = vneg(sn);
+        }
+#endif
 
         int mat = g_mat[id];
         Vec3 alb = (FLOOR_CHECKER && id == 0) ? checker(p) : v3(g_ar[id], g_ag[id], g_ab[id]);
@@ -403,33 +573,38 @@ static Vec3 trace(Vec3 o, Vec3 d, Rng *rng, int max_depth) {
 
         Vec3 nd;
         if (mat == LAMBERTIAN) {
-            L = vadd(L, vmul(T, sample_lights(p, fn, alb, rng)));
-            Vec3 sc = vadd(fn, random_unit(rng));
-            nd = vlen2(sc) < 1e-16f ? fn : vnorm(sc);
+            L = vadd(L, vmul(T, sample_lights(p, fn, sn, alb, rng)));
+            Vec3 sc = vadd(sn, random_unit(rng));
+            nd = vlen2(sc) < 1e-16f ? sn : vnorm(sc);
             T = vmul(T, alb);
             specular = 0;
         } else if (mat == METAL) {
-            Vec3 refl = vsub(d, vscl(fn, 2.0f * vdot(d, fn)));
+            Vec3 refl = vsub(d, vscl(sn, 2.0f * vdot(d, sn)));
             nd = vnorm(vadd(vnorm(refl), vscl(random_unit(rng), g_param[id])));
             T = vmul(T, alb);
             specular = 1;
         } else { /* DIELECTRIC */
             float ior = g_param[id];
             float ratio = front ? 1.0f/ior : ior;
-            float ct = fminf(-vdot(d, fn), 1.0f);
+            float ct = fminf(-vdot(d, sn), 1.0f);
             float st = sqrtf(fmaxf(0.0f, 1.0f - ct*ct));
             float r0 = (1.0f - ratio) / (1.0f + ratio); r0 *= r0;
             float sch = r0 + (1.0f - r0) * powf(1.0f - ct, 5.0f);
             if (ratio * st > 1.0f || randf(rng) < sch) {
-                nd = vnorm(vsub(d, vscl(fn, 2.0f * vdot(d, fn))));
+                nd = vnorm(vsub(d, vscl(sn, 2.0f * vdot(d, sn))));
             } else {
-                Vec3 perp = vscl(vadd(d, vscl(fn, ct)), ratio);
-                Vec3 par  = vscl(fn, -sqrtf(fabsf(1.0f - fminf(vlen2(perp), 1.0f))));
+                Vec3 perp = vscl(vadd(d, vscl(sn, ct)), ratio);
+                Vec3 par  = vscl(sn, -sqrtf(fabsf(1.0f - fminf(vlen2(perp), 1.0f))));
                 nd = vnorm(vadd(perp, par));
             }
             specular = 1;
         }
 
+#ifdef MESH_FILE
+        /* A smoothed normal can send a matte or metal bounce below the real
+         * surface, where it would leak into the mesh. Drop those paths. */
+        if (is_mesh && mat != DIELECTRIC && vdot(nd, fn) <= 0.0f) break;
+#endif
         /* offset to whichever side the new ray is going */
         o = vadd(p, vscl(fn, vdot(nd, fn) > 0.0f ? RAY_EPS : -RAY_EPS));
         d = nd;
@@ -609,6 +784,9 @@ int main(int argc, char **argv) {
     }
 
     scene_init();
+#ifdef MESH_FILE
+    mesh_load();
+#endif
     Vec3 from = v3(CAM_FROM), at = v3(CAM_AT);
     camera_init(from, at, v3(0,1,0), CAM_VFOV, (float)width/(float)height,
                 CAM_APERTURE, sqrtf(vlen2(vsub(from, at))));
@@ -619,6 +797,9 @@ int main(int argc, char **argv) {
 #endif
     fprintf(stderr, "  %dx%d  %d spp  depth %d  %d threads  %d objects\n",
             width, height, spp, max_depth, threads, N_OBJ);
+#ifdef MESH_FILE
+    fprintf(stderr, "  %u triangles, %u BVH nodes (%s)\n", g_ntri, g_nnode, MESH_FILE);
+#endif
 
     float *acc = malloc(sizeof(float) * 3 * (size_t)width * (size_t)height);
     double t0 = now_sec();

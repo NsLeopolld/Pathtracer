@@ -7,6 +7,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from make_scenes import build_scene, domino_path, billiard_rack, stairs_steps
+import meshes as MESH
 
 DIFFUSE, CONDUCTOR, DIELECTRIC, PLASTIC, EMISSIVE, THINFILM = range(6)
 
@@ -23,7 +24,7 @@ assert MAT_DTYPE.itemsize == 52, MAT_DTYPE.itemsize
 class Scene:
     def __init__(self, name):
         self.name = name
-        self.mats, self.spheres, self.planes, self.boxes = [], [], [], []
+        self.mats, self.spheres, self.planes, self.boxes, self.meshes = [], [], [], [], []
         self.cam = dict(frm=(0, 1, 5), at=(0, 1, 0), vfov=35.0,
                         aperture=0.0, focus=None)
         self.sky = ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0))
@@ -59,6 +60,10 @@ class Scene:
         half = np.asarray(size, float) / 2
         self.boxes.append((*centre, np.cos(a), *half, np.sin(a), mat))
 
+    def mesh(self, mesh, mat):
+        """A meshes.Mesh (e.g. from meshes.load_obj(...).placed(...)) in one material."""
+        self.meshes.append((mesh, mat))
+
     # -- packing ---------------------------------------------------------
     def pack(self):
         sph = np.array([s[:4] for s in self.spheres], np.float32).reshape(-1, 4)
@@ -78,7 +83,9 @@ class Scene:
                 lum = 0.2126*m["cr"] + 0.7152*m["cg"] + 0.0722*m["cb"]
                 lights.append(i)
                 power.append(float(lum) * s[3] ** 2)
-        return dict(sph=sph, smat=smat, pln=pln, pmat=pmat, box=box, bmat=bmat, mats=mats,
+        tris = (MESH.pack_cached(self.meshes, os.path.join(os.path.dirname(__file__), ".bvh_cache"))
+                if self.meshes else None)
+        return dict(sph=sph, smat=smat, pln=pln, pmat=pmat, box=box, bmat=bmat, mats=mats, tris=tris,
                     lights=np.array(lights, np.int32),
                     power=np.array(power, np.float32))
 
@@ -296,6 +303,27 @@ def stairs():
     return s
 
 
+def suzanne():
+    """Three Blender monkeys, same layout as make_scenes.suzanne()."""
+    s = Scene("suzanne")
+    s.cam = dict(frm=(0.0, 1.4, 5.6), at=(0.0, 0.5, 0.0), vfov=32.0, aperture=0.03, focus=None)
+    s.sky = ((0.30, 0.32, 0.38), (0.06, 0.08, 0.14))
+    s.bloom, s.exposure, s.look = 0.02, 1.0, "punchy"
+    s.plane((0, 1, 0), 0.0, s.mat(PLASTIC, (0.62, 0.60, 0.58), rough=0.2,
+                                  checker=(0.14, 0.15, 0.17), cscale=1.15))
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    monkey = MESH.load_obj(os.path.join(root, "models", "suzanne.obj"))
+    s.mesh(monkey.placed(height=1.0, at=(-1.7, 0, 0.2), rotate=(0, 25, 0)),
+           s.mat(DIELECTRIC, ior=1.5, abbe=35.0))
+    s.mesh(monkey.placed(height=1.0, at=(0.0, 0, -0.3)),
+           s.mat(CONDUCTOR, (1.0, 0.766, 0.336), rough=0.12))
+    s.mesh(monkey.placed(height=1.0, at=(1.7, 0, 0.2), rotate=(0, -25, 0)),
+           s.mat(PLASTIC, (0.7, 0.18, 0.12), rough=0.35))
+    s.sphere((-3.0, 4.5, 3.5), 0.9, s.mat(EMISSIVE, (14, 12, 10)))
+    s.sphere((5.0, 3.5, 0.5), 0.5, s.mat(EMISSIVE, (10, 12, 17)))
+    return s
+
+
 # -------------------------------------------------------- test scenes --
 def furnace(kind="diffuse", shape="sphere"):
     """White furnace test scene: albedo-1 object in a uniform sky of 1.0.
@@ -316,6 +344,9 @@ def furnace(kind="diffuse", shape="sphere"):
     )
     if shape == "box":
         s.box((0, 0, 0), (1.4, 1.4, 1.4), mats[kind](), rot_y=30.0)
+    elif shape == "mesh":
+        # flat normals: interpolated ones don't conserve energy exactly
+        s.mesh(MESH.icosphere(3, smooth=False), mats[kind]())
     else:
         s.sphere((0, 0, 0), 1.0, mats[kind]())
     return s
@@ -357,9 +388,11 @@ def cornell_boxes():
 
 REGISTRY = dict(hero=hero, cornell=cornell, neon=neon, mistest=mistest,
                 mirrors=mirrors, dominoes=dominoes, billiards=billiards,
-                gallery=gallery, stairs=stairs,
+                gallery=gallery, stairs=stairs, suzanne=suzanne,
                 **{"mistest-area": mistest_area, "cornell-boxes": cornell_boxes},
                 **{f"furnace-{k}": (lambda k=k: furnace(k)) for k in
                    ("diffuse", "conductor", "glass", "dispersive", "film", "plastic")},
                 **{f"furnace-{k}-box": (lambda k=k: furnace(k, "box")) for k in
-                   ("diffuse", "glass", "film")})
+                   ("diffuse", "glass", "film")},
+                **{f"furnace-{k}-mesh": (lambda k=k: furnace(k, "mesh")) for k in
+                   ("diffuse", "glass", "conductor")})

@@ -11,13 +11,21 @@ Objects:
   plane   ((nx, ny, nz), offset, (r, g, b), "MAT", param)   all p with n.p = offset
   box     ((x, y, z), (sx, sy, sz), (r, g, b), "MAT", param[, rot_y])
           centre, full size, optional rotation around y in degrees
+  mesh    (meshes.Mesh, (r, g, b), "MAT", param)
+          e.g. meshes.load_obj("models/suzanne.obj").placed(height=1, at=(0, 0, 0));
+          triangles go to scene_NAME.mesh next to the header, which
+          pathtracer.c reads at startup
 
 MAT is LAMBERTIAN, METAL (param = fuzz), DIELECTRIC (param = ior) or
 EMISSIVE. The older scenes use r=1000 spheres as walls, from before
 planes existed.
 """
 
+import os
+
 import numpy as np
+
+import meshes as MESH
 
 R = 1000.0
 LAMBERTIAN, METAL, DIELECTRIC, EMISSIVE = 0, 1, 2, 3
@@ -85,10 +93,13 @@ def f3(v):
     return ", ".join(f"{x:.6f}f" for x in v)
 
 
-def emit(path, title, spheres, knobs, planes=(), boxes=()):
+def emit(path, title, spheres, knobs, planes=(), boxes=(), meshes=()):
     for obj in (*spheres, *planes, *boxes):
         if obj[3] not in MATS:
             raise ValueError(f"{path}: unknown material {obj[3]!r}, use one of {MATS}")
+    for m in meshes:
+        if m[2] not in MATS:
+            raise ValueError(f"{path}: unknown mesh material {m[2]!r}, use one of {MATS}")
     for sph in spheres:
         if sph[1] == 0:
             raise ValueError(f"{path}: sphere at {sph[0]} has radius 0")
@@ -122,12 +133,24 @@ def emit(path, title, spheres, knobs, planes=(), boxes=()):
             rot = b[5] if len(b) > 5 else 0.0
             out.append(f"  {{ {f3(c)}, {f3(size)}, {rot:.6f}f, {f3(alb)}, {mat}, {param:.6f}f }},")
         out += ["};"]
+    ntri = 0
+    if meshes:
+        mesh_path = os.path.splitext(path)[0] + ".mesh"
+        packed = MESH.pack([(m[0], k) for k, m in enumerate(meshes)])
+        MESH.write_mesh_file(mesh_path, packed)
+        ntri = len(packed["mat"])
+        out += ["", f'#define MESH_FILE "{os.path.basename(mesh_path)}"   /* {ntri} triangles */',
+                f"#define N_MESH_MATS {len(meshes)}",
+                "static const MeshMat MESH_MATS[N_MESH_MATS] = {"]
+        for (_, alb, mat, param) in meshes:
+            out.append(f"  {{ {f3(alb)}, {mat}, {param:.6f}f }},")
+        out += ["};"]
     out += ["", "#endif", ""]
     with open(path, "w") as fh:
         fh.write("\n".join(out))
     lights = sum(1 for o in (*spheres, *planes, *boxes) if o[3] == "EMISSIVE")
     print(f"{path}: {len(spheres)} spheres, {len(planes)} planes, "
-          f"{len(boxes)} boxes, {lights} lights")
+          f"{len(boxes)} boxes, {ntri} triangles, {lights} lights")
 
 
 def hero():
@@ -458,6 +481,33 @@ def stairs():
     emit("scene_stairs.h", "Spiral stairs", spheres, knobs, planes, boxes)
 
 
+def suzanne():
+    """Three copies of Blender's monkey (models/suzanne.obj): glass, gold, clay."""
+    monkey = MESH.load_obj(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                        "models", "suzanne.obj"))
+    meshes = [
+        (monkey.placed(height=1.0, at=(-1.7, 0, 0.2), rotate=(0, 25, 0)), (1, 1, 1), "DIELECTRIC", 1.5),
+        (monkey.placed(height=1.0, at=(0.0, 0, -0.3)), (1.0, 0.78, 0.34), "METAL", 0.05),
+        (monkey.placed(height=1.0, at=(1.7, 0, 0.2), rotate=(0, -25, 0)), (0.7, 0.18, 0.12), "LAMBERTIAN", 0),
+    ]
+    planes = [((0, 1, 0), 0.0, (0.8, 0.8, 0.8), "LAMBERTIAN", 0)]     # checker floor
+    spheres = [
+        ((-3.0, 4.5, 3.5), 0.9, (14, 12, 10), "EMISSIVE", 0),
+        ((5.0, 3.5, 0.5), 0.5, (10, 12, 17), "EMISSIVE", 0),
+    ]
+    knobs = {
+        "CAM_FROM": "0.0f, 1.4f, 5.6f",
+        "CAM_AT": "0.0f, 0.5f, 0.0f",
+        "CAM_VFOV": "32.0f",
+        "CAM_APERTURE": "0.03f",
+        "SKY_HORIZON": "0.30f, 0.32f, 0.38f",
+        "SKY_ZENITH": "0.06f, 0.08f, 0.14f",
+        "FLOOR_CHECKER": "1",
+        "EXPOSURE": "1.0f",
+    }
+    emit("scene_suzanne.h", "Suzanne", spheres, knobs, planes, meshes=meshes)
+
+
 if __name__ == "__main__":
     hero()
     cornell()
@@ -468,3 +518,4 @@ if __name__ == "__main__":
     billiards()
     gallery()
     stairs()
+    suzanne()

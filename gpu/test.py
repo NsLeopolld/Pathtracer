@@ -19,9 +19,12 @@ for kind, tol, note in [("diffuse", 0.004, ""), ("glass", 0.004, ""),
                         ("conductor", 0.004, "with Turquin energy compensation"),
                         ("plastic", 0.06, "uncoupled coat loss expected"),
                         ("diffuse-box", 0.004, ""), ("glass-box", 0.004, ""),
-                        ("film-box", 0.004, "")]:
+                        ("film-box", 0.004, ""), ("diffuse-mesh", 0.004, ""),
+                        ("glass-mesh", 0.004, "faceted glass traps light: needs depth 512"),
+                        ("conductor-mesh", 0.004, "")]:
     hdr, st = R.render(SC.REGISTRY[f"furnace-{kind}"](), 192, 192, max_spp=512,
-                       min_spp=512, chunk=32, adaptive=False, depth=32, quiet=True)
+                       min_spp=512, chunk=32, adaptive=False,
+                       depth=512 if kind == "glass-mesh" else 32, quiet=True)
     v = cp.asnumpy(hdr).mean()
     check(f"furnace {kind}", float(v), 1.0, tol, note)
 

@@ -20,6 +20,30 @@ def build_module(ld_groups=8):
     return cp.RawModule(code=src, options=tuple(opts), backend="nvrtc")
 
 
+_keep = []     # device arrays the kernel reaches through c_tri etc.; must stay alive
+
+
+def _pointer(mod, name, arr):
+    """Store a device array's address in a __constant__ pointer."""
+    _keep.append(arr)
+    cp.ndarray((1,), cp.uint64, memptr=mod.get_global(name))[...] = arr.data.ptr
+
+
+def _upload_tris(mod, t):
+    """Triangles and BVH from meshes.pack(), in the float4 layout kernel.cu reads."""
+    n = len(t["mat"])
+    tri = np.zeros((n, 3, 4), np.float32)
+    tri[:, 0, :3], tri[:, 1, :3], tri[:, 2, :3] = t["v0"], t["e1"], t["e2"]
+    nrm = np.zeros((n, 3, 4), np.float32)
+    nrm[:, :, :3] = t["n"]
+    _pointer(mod, "c_tri", cp.asarray(tri))
+    _pointer(mod, "c_tnrm", cp.asarray(nrm))
+    _pointer(mod, "c_tmat", cp.asarray(t["mat"].astype(np.int32)))
+    # the node struct is already two float4s with the ints stored as bits
+    _pointer(mod, "c_bvh", cp.asarray(np.frombuffer(t["nodes"].tobytes(), np.float32)))
+    return n, len(t["nodes"])
+
+
 def _const(mod, name, arr):
     if arr.size == 0:
         return
@@ -46,8 +70,9 @@ def upload(mod, scene, width, height):
     _const(mod, "c_bmat", p["bmat"])
     _const(mod, "c_light", p["lights"])
     _const(mod, "c_lpow", p["power"])
-    _const(mod, "c_cnt", np.array([len(p["sph"]), len(p["pln"]),
-                                   len(p["lights"]), len(p["bmat"])], np.int32))
+    ntri, nnode = _upload_tris(mod, p["tris"]) if p["tris"] is not None else (0, 0)
+    _const(mod, "c_cnt", np.array([len(p["sph"]), len(p["pln"]), len(p["lights"]),
+                                   len(p["bmat"]), ntri, nnode, 0, 0], np.int32))
     _const(mod, "c_cam", scene.camera(width / height))
     sky = np.zeros(8, np.float32)
     sky[0:3], sky[3:6] = scene.sky[0], scene.sky[1]

@@ -32,7 +32,11 @@ gcc -O3 -march=native -ffast-math -fopenmp \
 
 Scenes: `scene.h` (default), `scene_cornell.h`, `scene_boxes.h` (Cornell
 box with boxes), `scene_neon.h`, `scene_mirrors.h`, `scene_dominoes.h`,
-`scene_billiards.h`, `scene_gallery.h` and `scene_stairs.h`.
+`scene_billiards.h`, `scene_gallery.h`, `scene_stairs.h` and
+`scene_suzanne.h` (three copies of Blender's monkey, from
+`models/suzanne.obj`). Mesh scenes also need their `.mesh` file, which
+`make_scenes.py` writes next to the header; it isn't committed, so run
+`python3 make_scenes.py` once after cloning.
 
 Flags: `--width --height --spp --depth --out` (`--help` lists them).
 Thread count comes from `OMP_NUM_THREADS`.
@@ -47,8 +51,8 @@ Thread count comes from `OMP_NUM_THREADS`.
 
 Environment setup is [below](#setup-for-the-cuda-version). Scenes: `hero`,
 `cornell`, `cornell-boxes`, `neon`, `mirrors`, `dominoes`, `billiards`,
-`gallery`, `stairs`, and the test scenes `mistest`, `mistest-area` and
-`furnace-*`. The newer scenes share their layouts with the C headers of the
+`gallery`, `stairs`, `suzanne`, and the test scenes `mistest`,
+`mistest-area` and `furnace-*`. The newer scenes share their layouts with the C headers of the
 same name, with the GPU's extra materials (glossy plastic, rough metal,
 dispersive glass).
 
@@ -102,14 +106,23 @@ shadow rays aimed at them, so plane and box lights are a lot noisier.
 Planes and boxes are tested in plain loops, not vectorized; a few dozen
 are fine.
 
+Triangle meshes come from OBJ files (`meshes.py`: positions, vertex
+normals for smooth shading, polygons, `usemtl` groups). They're put in a
+BVH built with the surface area heuristic, the same tree in both
+renderers. On 200k random rays at Suzanne, the C traversal finds exactly
+the same hits as testing every triangle, about 200× faster. Both
+renderers render a Blender export (`models/suzanne.obj`) and give the
+same silhouette.
+
 **CUDA** (`gpu/`): spectral. 4 wavelengths per path (hero wavelength
 sampling), which is what dispersion and thin film need. Also has MIS
 between light and BSDF sampling (power heuristic), GGX metals with Turquin
 energy compensation, coated diffuse, adaptive sampling, AgX tonemapping,
 glare and dithering. The kernel is compiled at runtime with NVRTC.
-Shapes are spheres, planes and boxes, same as the C version (up to 64
-spheres, 8 planes, 16 boxes and 64 lights; `render.py` refuses scenes over
-that).
+Shapes are spheres, planes, boxes and triangle meshes, same as the C
+version (up to 64 spheres, 8 planes, 16 boxes and 64 lights; `render.py`
+refuses scenes over that; meshes have no fixed limit). The mesh BVH is
+cached in `gpu/.bvh_cache/` so big meshes only build once.
 
 RGB colours are converted to spectra with a basis from Mallett & Yuksel
 2019, solved with constrained optimisation: three smooth curves that sum to
@@ -129,14 +142,18 @@ wavelength.
 disappear, i.e. every pixel reads 1.0. If it doesn't, energy is being lost
 or added somewhere.
 
-| Material | Sphere | Box |
-|---|---:|---:|
-| Diffuse | 0.99995 | 0.99996 |
-| Glass | 0.99995 | 0.99993 |
-| Dispersive glass | 0.99983 | |
-| Thin film | 0.99989 | 0.99992 |
-| Rough conductor | 0.99981 | |
-| Coated diffuse | 0.97905 | |
+| Material | Sphere | Box | Mesh |
+|---|---:|---:|---:|
+| Diffuse | 0.99995 | 0.99996 | 0.99995 |
+| Glass | 0.99995 | 0.99993 | 0.99990 |
+| Dispersive glass | 0.99983 | | |
+| Thin film | 0.99989 | 0.99992 | |
+| Rough conductor | 0.99981 | | 0.99980 |
+| Coated diffuse | 0.97905 | | |
+
+The mesh is a faceted icosphere. Faceted glass traps a lot of light by
+total internal reflection, so that test runs with 512 bounces; at the
+usual 32 it reads 0.993, all of it from paths cut off early.
 
 Dispersive glass passing means the hero wavelength reweighting is right.
 Rough conductor was at 0.888 before energy compensation
@@ -209,7 +226,9 @@ The venv ends up around 1.6 GB, nearly all CUDA libraries.
 
 ```
 pathtracer.c         C renderer
-make_scenes.py       scene definitions, writes the scene*.h headers
+make_scenes.py       scene definitions, writes the scene*.h headers (+ .mesh files)
+meshes.py            OBJ loading, placement, BVH building (both renderers)
+models/              OBJ files
 gpu/kernel.cu        spectral path tracer (CUDA)
 gpu/render.py        host side: scene upload, adaptive loop, post
 gpu/png.py           PNG writer
@@ -224,15 +243,18 @@ render*.png          output
 ```
 
 Generated headers and lookup tables are committed so a fresh clone builds
-without running the generators first.
+without running the generators first. The exception is `.mesh` files,
+which are several MB and rebuild in seconds.
 
 ---
 
 ## Known limitations
 
-- **No triangles or meshes.** Spheres, planes and boxes only. For scenes
-  this small a linear loop over objects is faster than a BVH, so there
-  isn't one.
+- **Meshes are the slow part.** Spheres, planes and boxes are tested in a
+  flat loop; only triangles go through the BVH. Suzanne ×3 (47k
+  triangles) runs at about 5M samples/s in C and 25M on the GPU, against
+  20M+ and 100M+ for the sphere scenes. No textures or UVs, and mesh
+  lights get no direct light sampling.
 - **Caustics are noisy.** Shadow rays can't reach lights through glass, so
   caustics converge slowly. `--clamp` cuts the fireflies but adds bias, so
   it's off by default.
