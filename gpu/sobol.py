@@ -1,13 +1,8 @@
 #!/usr/bin/env python3
 """
-Sobol direction numbers for the first four dimensions, plus the tests that
-prove they are right.
-
-Generated from the Joe & Kuo initialisation (new-joe-kuo-6.21201): each
-dimension has a primitive polynomial (degree s, coefficient bits a) and
-initial direction integers m_i. Rather than trusting the numbers, the
-properties they are supposed to have are checked below -- a wrong
-recurrence fails the net test immediately.
+Sobol direction numbers for the first 4 dims (Joe & Kuo,
+new-joe-kuo-6.21201), plus checks for stratification and the (0,m,2)-net
+property. A wrong recurrence fails the net check.
 """
 
 import numpy as np
@@ -79,7 +74,7 @@ def check():
                 print(f"  FAIL (0,m,2)-net for dims (0,1) at n={n}, {nx}x{ny}")
     print(f"  net + stratification tests: {'PASS' if ok else 'FAIL'}")
 
-    # Star discrepancy proxy: Sobol must beat random by a wide margin.
+    # rough discrepancy estimate vs random, sobol should be much lower
     n = 4096
     p = sobol_points(n)[:, :2]
     r = np.random.default_rng(0).random((n, 2))

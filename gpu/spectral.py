@@ -2,24 +2,19 @@
 """
 Spectral tables for the GPU path tracer.
 
-A spectral renderer needs to turn the RGB colours a scene is authored in
-back into spectra. That problem is underdetermined -- infinitely many
-spectra look like the same RGB -- so the upsampling has to be chosen with
-care. This builds the Mallett & Yuksel (2019) basis: three smooth spectra
-B_r, B_g, B_b such that
+Scenes are authored in RGB, so colours need converting to spectra. Uses
+the Mallett & Yuksel (2019) basis: three smooth spectra B_r, B_g, B_b with
 
     B_r(l) + B_g(l) + B_b(l) = 1     for every wavelength
     0 <= B_k(l) <= 1                 for every wavelength
     <B_k, response_j> = delta_kj     exact RGB round-trip
 
-The first two conditions make reflectance upsampling energy-conserving: a
-surface can never reflect more light than it receives, at any wavelength.
-The third makes the render agree with the authored colour.
+The first two keep reflectances <= 1 at every wavelength, the third means
+RGB -> spectrum -> RGB gives back the same colour.
 
-The basis is found by constrained least squares, maximising smoothness.
-Colour matching functions are the Wyman-Sloan-Shirley (2013) multi-lobe
-Gaussian fits; the illuminant is a 6504 K Planckian, which is analytic and
-within a hair of D65.
+Solved as constrained least squares minimising roughness. CMFs are the
+Wyman-Sloan-Shirley (2013) fits, illuminant is a 6504 K blackbody (close
+enough to D65, no table needed).
 """
 
 import numpy as np
@@ -69,8 +64,8 @@ def build():
     illum = planckian(lam)
     resp = XYZ_TO_RGB @ cie_xyz(lam)          # sRGB camera response, 3 x N
 
-    # White-balance each channel so the illuminant maps to exactly (1,1,1).
-    # This is what makes the sum-to-one constraint consistent.
+    # normalize so the illuminant maps to (1,1,1), otherwise sum-to-one
+    # and the round-trip constraint conflict
     norm = (resp * illum).sum(1) * STEP
     resp = resp / norm[:, None]
     C = resp * illum * STEP                    # 3 x N: <spectrum, C_j> -> RGB_j
@@ -95,11 +90,11 @@ def build():
         return g.ravel()
 
     cons = [
-        # Sum to one at every wavelength -> energy conserving.
+        # sum to one at every wavelength
         {"type": "eq",
          "fun": lambda v: unpack(v).sum(0) - 1.0,
          "jac": lambda v: np.tile(np.eye(NBINS), (1, 3))},
-        # Exact round-trip: basis k must produce unit RGB in channel k only.
+        # basis k -> unit RGB in channel k only
         {"type": "eq",
          "fun": lambda v: (unpack(v) @ C.T - np.eye(3)).ravel(),
          "jac": lambda v: np.kron(np.eye(3), C).reshape(9, 3 * NBINS)},
@@ -111,7 +106,7 @@ def build():
                    method="SLSQP", options={"maxiter": 800, "ftol": 1e-12})
     B = unpack(res.x)
 
-    # --- verify, loudly -------------------------------------------------
+    # --- checks ---------------------------------------------------------
     rt = B @ C.T
     print(f"  solver: {res.message} ({res.nit} iters)")
     print(f"  round-trip error   max |B_k.C_j - I| = {np.abs(rt - np.eye(3)).max():.2e}")

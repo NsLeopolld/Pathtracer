@@ -1,17 +1,10 @@
 #!/usr/bin/env python3
 """
-A Monte Carlo path tracer that hand-rolls its own PNG encoder.
+NumPy path tracer with its own PNG writer (zlib only for deflate + crc32).
 
-No PIL. No imageio. No cv2. The only thing borrowed for output is zlib's
-DEFLATE (which the PNG spec mandates) and its CRC-32 table. Everything
-else -- chunk framing, the IHDR header, adaptive per-scanline filtering --
-is assembled here from the bytes up.
-
-The renderer itself is a real unbiased path tracer: importance-sampled
-diffuse bounces, Fresnel dielectrics via Schlick, glossy metals, thin-lens
-depth of field, and Russian-roulette path termination. It is vectorized
-over rays rather than looped over pixels, so the whole frame advances one
-bounce at a time.
+Cosine-weighted diffuse, Schlick dielectrics, fuzzy metal, thin lens DOF,
+NEE on sphere lights, Russian roulette. Vectorized over rays, so the whole
+frame advances one bounce per iteration.
 
     python3 pathtracer.py [--width 640] [--spp 64] [--out render.png]
 """
@@ -29,30 +22,24 @@ from concurrent.futures import ProcessPoolExecutor
 import numpy as np
 
 # --------------------------------------------------------------------------
-# Part 1: the PNG encoder. This is the "trick" -- a spec-faithful writer.
+# PNG output
 # --------------------------------------------------------------------------
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 
 def _chunk(kind: bytes, payload: bytes) -> bytes:
-    """One PNG chunk: length, type, data, CRC-32 over (type + data)."""
+    """length + type + data + crc32(type + data)"""
     crc = zlib.crc32(kind + payload) & 0xFFFFFFFF
     return struct.pack(">I", len(payload)) + kind + payload + struct.pack(">I", crc)
 
 
 def _filter_scanlines(rgb: np.ndarray) -> bytes:
-    """Apply PNG's adaptive filtering, picking the best filter per scanline.
+    """Per-scanline adaptive filtering (None/Sub/Up/Average/Paeth).
 
-    PNG defines five filters (None/Sub/Up/Average/Paeth) that predict each
-    byte from its left, upper, and upper-left neighbours. Encoders choose
-    per row; the standard heuristic is to keep whichever candidate has the
-    smallest sum of absolute signed deviations, since bytes near zero are
-    what DEFLATE compresses best.
-
-    Filters operate on the *unfiltered* neighbours, so every row can be
-    computed without a sequential dependency -- which means numpy can do
-    all five candidates at once.
+    Picks the filter with the smallest sum of abs signed bytes per row,
+    the usual libpng heuristic. Filters read unfiltered neighbours, so all
+    five candidates for a row are computed at once.
     """
     height, width, _ = rgb.shape
     stride = width * 3  # bytes per scanline
@@ -66,7 +53,7 @@ def _filter_scanlines(rgb: np.ndarray) -> bytes:
         up = prior                                                      # b
         upleft = np.concatenate((np.zeros(3, np.int16), prior[:-3]))    # c
 
-        # Paeth predictor: pick whichever neighbour is closest to a + b - c.
+        # paeth: whichever of a, b, c is closest to a + b - c
         p = left + up - upleft
         pa, pb, pc = np.abs(p - left), np.abs(p - up), np.abs(p - upleft)
         paeth = np.where(
@@ -84,7 +71,7 @@ def _filter_scanlines(rgb: np.ndarray) -> bytes:
         best, best_cost = 0, None
         for idx, cand in enumerate(candidates):
             band = cand.astype(np.uint8).astype(np.int16)
-            # Score signed bytes: values near 0 (i.e. 0..127 and 128..255) win.
+            # treat bytes as signed, so 255 counts as -1
             cost = int(np.minimum(band, 256 - band).sum())
             if best_cost is None or cost < best_cost:
                 best, best_cost = idx, cost
@@ -97,15 +84,15 @@ def _filter_scanlines(rgb: np.ndarray) -> bytes:
 
 
 def write_png(path: str, rgb: np.ndarray) -> int:
-    """Serialize an (H, W, 3) uint8 array as a PNG, entirely by hand."""
+    """Write an (H, W, 3) uint8 array as an 8-bit RGB PNG. Returns file size."""
     height, width, _ = rgb.shape
     ihdr = struct.pack(
         ">IIBBBBB",
         width, height,
         8,   # bit depth
         2,   # colour type 2 = truecolour RGB
-        0,   # compression: DEFLATE (the only legal value)
-        0,   # filter method 0 (the adaptive five above)
+        0,   # compression method (deflate, only option)
+        0,   # filter method 0
         0,   # no interlacing
     )
 
@@ -125,7 +112,7 @@ def write_png(path: str, rgb: np.ndarray) -> int:
 
 
 # --------------------------------------------------------------------------
-# Part 2: vector math helpers (operating on (N, 3) ray batches)
+# vector helpers, all on (N, 3) arrays
 # --------------------------------------------------------------------------
 
 LAMBERTIAN, METAL, DIELECTRIC, EMISSIVE = 0, 1, 2, 3
@@ -140,13 +127,13 @@ def dot(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 
 
 def random_unit(n: int, rng: np.random.Generator) -> np.ndarray:
-    """Uniform points on the unit sphere, via the normalized-Gaussian trick."""
+    """Uniform on the unit sphere (normalized gaussian)."""
     v = rng.standard_normal((n, 3))
     return v / np.linalg.norm(v, axis=-1, keepdims=True)
 
 
 # --------------------------------------------------------------------------
-# Part 3: the scene
+# scene
 # --------------------------------------------------------------------------
 
 
@@ -160,22 +147,22 @@ def build_scene():
         mats.append(mat)
         params.append(param)
 
-    # Ground: a sphere so large it reads as a plane. Shaded with a checker.
+    # ground, big enough to pass for a plane. checker is applied in trace()
     add((0.0, -1000.0, 0.0), 1000.0, (0.0, 0.0, 0.0), LAMBERTIAN, 1.0)
 
-    # The three heroes.
+    # main row
     add((0.0, 1.0, 0.0), 1.0, (1.0, 1.0, 1.0), DIELECTRIC, 1.52)   # glass
     add((-2.35, 1.0, -0.35), 1.0, (0.72, 0.28, 0.22), LAMBERTIAN)   # clay
     add((2.35, 1.0, -0.35), 1.0, (0.93, 0.87, 0.74), METAL, 0.04)   # gold
 
-    # A hollow glass shell: negative radius flips the normal inward.
+    # negative radius = inward normals, makes the glass ball hollow
     add((0.0, 1.0, 0.0), -0.82, (1.0, 1.0, 1.0), DIELECTRIC, 1.52)
 
-    # A warm key light floating out of frame, plus a cool rim light.
+    # warm key light (off screen) + cool rim light
     add((-6.0, 7.5, 4.0), 2.2, (10.0, 7.4, 4.6), EMISSIVE)
     add((7.5, 3.0, -6.0), 1.6, (1.6, 3.0, 5.2), EMISSIVE)
 
-    # Scatter some small spheres on the floor, deterministically.
+    # small random spheres, fixed seed so the scene is reproducible
     rng = np.random.default_rng(20260922)
     for _ in range(38):
         r = float(rng.uniform(0.14, 0.26))
@@ -183,7 +170,7 @@ def build_scene():
         dist = float(rng.uniform(2.0, 8.5))
         cx, cz = np.cos(ang) * dist, np.sin(ang) * dist - 1.0
         if abs(cx) < 3.6 and abs(cz) < 1.4:
-            continue  # keep the hero row clear
+            continue  # don't overlap the main row
         roll = rng.random()
         if roll < 0.55:
             tint = rng.uniform(0.15, 0.85, 3)
@@ -204,7 +191,7 @@ def build_scene():
 
 
 def sky(d: np.ndarray) -> np.ndarray:
-    """A soft dusk gradient used as the infinite-area light."""
+    """Vertical gradient, horizon -> zenith. Only light besides the emitters."""
     t = (0.5 * (d[:, 1] + 1.0))[:, None]
     horizon = np.array([0.52, 0.42, 0.38])
     zenith = np.array([0.10, 0.16, 0.30])
@@ -212,19 +199,19 @@ def sky(d: np.ndarray) -> np.ndarray:
 
 
 # --------------------------------------------------------------------------
-# Part 4: intersection + shading, vectorized over every live ray
+# intersection / shading
 # --------------------------------------------------------------------------
 
 
 def intersect(origins, dirs, centers, radii):
-    """Closest hit per ray. Loops over spheres (few) not rays (millions)."""
+    """Closest hit per ray. Loop is over spheres, rays are vectorized."""
     n = origins.shape[0]
     best_t = np.full(n, np.inf)
     best_id = np.full(n, -1, np.int32)
 
     for i in range(centers.shape[0]):
         oc = origins - centers[i]
-        # dirs are unit length, so the quadratic's leading coefficient is 1.
+        # dirs are normalized so a == 1
         half_b = dot(dirs, oc)
         c = dot(oc, oc) - radii[i] * radii[i]
         disc = half_b * half_b - c
@@ -243,7 +230,7 @@ def intersect(origins, dirs, centers, radii):
 
 
 def checker(points: np.ndarray) -> np.ndarray:
-    """Procedural floor: no texture file, just the sign of a sine product."""
+    """Floor checker from sign(sin x * sin z)."""
     s = np.sin(points[:, 0] * 1.15) * np.sin(points[:, 2] * 1.15)
     light = np.array([0.62, 0.60, 0.58])
     dark = np.array([0.14, 0.15, 0.17])
@@ -251,7 +238,7 @@ def checker(points: np.ndarray) -> np.ndarray:
 
 
 def onb(w: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """An orthonormal basis around w, avoiding the degenerate axis."""
+    """Two vectors perpendicular to w (w assumed normalized)."""
     a = np.where(
         np.abs(w[:, 0:1]) > 0.9,
         np.array([[0.0, 1.0, 0.0]]),
@@ -262,12 +249,8 @@ def onb(w: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
 
 def sample_lights(point, facing, albedo, throughput, scene, rng, lights):
-    """Next-event estimation: connect each diffuse hit straight to a light.
-
-    Rather than hoping a random bounce stumbles onto a small emitter, aim a
-    shadow ray at one. Directions are drawn from the cone the light subtends
-    -- uniform-on-sphere sampling would waste half its samples on the far
-    side -- with pdf = 1 / (2*pi*(1 - cos(theta_max))) in solid angle.
+    """NEE for diffuse hits: pick a light uniformly, sample the cone it
+    subtends. pdf = 1 / (2*pi*(1 - cos_max)) in solid angle.
     """
     centers, radii, albedos, _, _ = scene
     m = point.shape[0]
@@ -281,7 +264,7 @@ def sample_lights(point, facing, albedo, throughput, scene, rng, lights):
     dist = np.sqrt(dist2)
     radius = np.abs(radii[chosen])
 
-    # Half-angle of the cone the sphere subtends from this shading point.
+    # cone half-angle as seen from the shading point
     cos_max = np.sqrt(np.maximum(0.0, 1.0 - (radius * radius) / np.maximum(dist2, 1e-12)))
     cos_t = 1.0 - rng.random(m) * (1.0 - cos_max)
     sin_t = np.sqrt(np.maximum(0.0, 1.0 - cos_t * cos_t))
@@ -300,7 +283,7 @@ def sample_lights(point, facing, albedo, throughput, scene, rng, lights):
     if not valid.any():
         return out
 
-    # Occlusion: the nearest thing along the shadow ray must BE the light.
+    # visible if the first thing the shadow ray hits is the light itself
     origin = point[valid] + 1e-4 * facing[valid]
     _, hit_id = intersect(origin, ldir[valid], centers, radii)
     visible = hit_id == chosen[valid]
@@ -309,14 +292,14 @@ def sample_lights(point, facing, albedo, throughput, scene, rng, lights):
 
     keep = np.flatnonzero(valid)[visible]
     pdf = 1.0 / (2.0 * np.pi * np.maximum(1.0 - cos_max[keep], 1e-9))
-    # Lambertian BRDF (albedo/pi) * cos / pdf, times the 1/N light-pick pdf.
+    # (albedo/pi) * cos / pdf, * N for the uniform light pick
     weight = (cos_surf[keep] / (np.pi * pdf) * lights.size)[:, None]
     out[keep] = throughput[keep] * albedo[keep] * albedos[chosen[keep]] * weight
     return out
 
 
 def trace(origins, dirs, scene, rng, max_depth=24):
-    """Advance every ray one bounce at a time, compacting as paths die."""
+    """Bounce all rays together, dropping dead paths each iteration."""
     centers, radii, albedos, mats, params = scene
     lights = np.flatnonzero(mats == EMISSIVE)
     if os.environ.get("NO_NEE"):
@@ -325,10 +308,9 @@ def trace(origins, dirs, scene, rng, max_depth=24):
 
     radiance = np.zeros((n, 3))
     throughput = np.ones((n, 3))
-    alive = np.arange(n)  # maps live rays back to their pixel slot
-    # A path may only collect emission on a hit if its last bounce was
-    # specular. Diffuse bounces already sampled the lights explicitly, so
-    # counting a chance hit too would double-count that light.
+    alive = np.arange(n)  # live ray -> pixel index
+    # only count emitter hits after a specular bounce; diffuse bounces
+    # already got that light through NEE, so it would be counted twice
     specular = np.ones(n, bool)
 
     for depth in range(max_depth):
@@ -350,7 +332,7 @@ def trace(origins, dirs, scene, rng, max_depth=24):
         t, sid = t[keep], sid[keep]
 
         point = origins + t[:, None] * dirs
-        # Dividing by the signed radius flips normals for the hollow shell.
+        # signed radius, so the inner shell gets inward normals
         normal = (point - centers[sid]) / radii[sid][:, None]
         front = dot(dirs, normal) < 0.0
         facing = np.where(front[:, None], normal, -normal)
@@ -359,19 +341,19 @@ def trace(origins, dirs, scene, rng, max_depth=24):
         albedo = albedos[sid]
         param = params[sid]
 
-        # Sphere 0 is the checkered floor; everything else uses flat albedo.
+        # sphere 0 is the floor
         floor = sid == 0
         if floor.any():
             albedo = albedo.copy()
             albedo[floor] = checker(point[floor])
 
-        # --- emissive: deposit light and retire the path -------------------
+        # emissive
         is_emissive = mat == EMISSIVE
         counts = is_emissive & specular
         if counts.any():
             radiance[alive[counts]] += throughput[counts] * albedo[counts]
 
-        # --- diffuse: explicit light connection, then a cosine bounce ------
+        # diffuse: NEE, then cosine-weighted bounce
         new_dir = np.zeros_like(dirs)
         is_diffuse = mat == LAMBERTIAN
         if is_diffuse.any():
@@ -385,7 +367,7 @@ def trace(origins, dirs, scene, rng, max_depth=24):
             new_dir[is_diffuse] = unit(scattered)
             throughput[is_diffuse] *= albedo[is_diffuse]
 
-        # --- metal: mirror reflection blurred by the fuzz parameter --------
+        # metal: reflect + fuzz
         is_metal = mat == METAL
         if is_metal.any():
             d, nrm = dirs[is_metal], facing[is_metal]
@@ -396,7 +378,7 @@ def trace(origins, dirs, scene, rng, max_depth=24):
             new_dir[is_metal] = unit(reflected)
             throughput[is_metal] *= albedo[is_metal]
 
-        # --- dielectric: Snell refraction with a Schlick-weighted coin -----
+        # glass: reflect or refract, chosen by schlick
         is_glass = mat == DIELECTRIC
         if is_glass.any():
             d, nrm = dirs[is_glass], facing[is_glass]
@@ -419,14 +401,14 @@ def trace(origins, dirs, scene, rng, max_depth=24):
             )[:, None] * nrm
             new_dir[is_glass] = np.where(must_reflect[:, None], mirror, perp + par)
 
-        # Retire emissive hits; everything else takes its new direction.
+        # emitters end the path
         survives = ~is_emissive
         origins = point[survives] + 1e-4 * new_dir[survives]
         dirs = unit(new_dir[survives])
         throughput, alive = throughput[survives], alive[survives]
         specular = np.ones(alive.size, bool) if lights.size == 0 else ~is_diffuse[survives]
 
-        # --- Russian roulette: unbiased early termination ------------------
+        # russian roulette
         if depth >= 4 and alive.size:
             p = np.clip(throughput.max(axis=1), 0.05, 1.0)
             live = rng.random(alive.size) < p
@@ -438,7 +420,7 @@ def trace(origins, dirs, scene, rng, max_depth=24):
 
 
 # --------------------------------------------------------------------------
-# Part 5: camera + driver
+# camera / main
 # --------------------------------------------------------------------------
 
 
@@ -462,7 +444,7 @@ class Camera:
 
     def rays(self, s, t, rng):
         n = s.shape[0]
-        # Sample the lens disc for depth of field.
+        # point on the lens disc (DOF)
         ang = rng.random(n) * 2.0 * np.pi
         rad = self.lens_radius * np.sqrt(rng.random(n))
         offset = (rad * np.cos(ang))[:, None] * self.u + (
@@ -479,7 +461,7 @@ class Camera:
 
 
 def render_tile(args):
-    """One worker: accumulate `samples` full-frame passes with its own seed."""
+    """Worker: render `samples` full-frame passes and return the sum."""
     width, height, samples, seed, max_depth = args
     rng = np.random.default_rng(seed)
     scene = build_scene()
@@ -498,7 +480,7 @@ def render_tile(args):
 
     total = np.zeros((width * height, 3))
     for _ in range(samples):
-        # Jitter inside the pixel footprint for free antialiasing.
+        # jitter within the pixel for AA
         s = (px + rng.random(px.size)) / width
         t = 1.0 - (py + rng.random(py.size)) / height
         origins, dirs = cam.rays(s, t, rng)
@@ -507,7 +489,7 @@ def render_tile(args):
 
 
 def tonemap(hdr: np.ndarray) -> np.ndarray:
-    """ACES filmic curve, then encode to sRGB-ish gamma 2.2."""
+    """ACES fit (Narkowicz) + gamma 2.2."""
     a, b, c, d, e = 2.51, 0.03, 2.43, 0.59, 0.14
     x = np.maximum(hdr, 0.0)
     mapped = np.clip((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0)
@@ -527,8 +509,7 @@ def main() -> int:
     height = int(round(width * 9 / 16))
     workers = max(1, opts.workers)
 
-    # Split the sample budget across processes; each is an independent
-    # estimator of the same integral, so averaging them is still unbiased.
+    # split spp across processes, each with its own seed; results are summed
     per = [opts.spp // workers] * workers
     for i in range(opts.spp % workers):
         per[i] += 1

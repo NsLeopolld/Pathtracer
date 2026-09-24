@@ -1,15 +1,12 @@
 // =====================================================================
 //  Spectral path tracer -- CUDA kernel
 //
-//  One thread owns one pixel and carries whole paths to completion.
-//  Colour is tracked as 4 wavelengths per path (hero wavelength sampling,
-//  Wilkie et al. 2014), which is what makes dispersion and thin-film
-//  interference possible at all: both are wavelength-dependent, so an RGB
-//  renderer physically cannot express them.
+//  One thread per pixel, full paths. 4 wavelengths per path (hero
+//  wavelength sampling, Wilkie et al. 2014), needed for dispersion and
+//  thin film, which RGB can't do.
 //
-//  Estimator per path: NEE + BSDF sampling combined with MIS (power
-//  heuristic). Lights are picked proportional to power/distance^2 from the
-//  shading point. Delta surfaces skip NEE and take MIS weight 1.
+//  NEE + BSDF sampling with MIS (power heuristic). Lights picked by
+//  power/dist^2 from the shading point. Delta surfaces skip NEE, weight 1.
 // =====================================================================
 
 #define NL        4
@@ -311,9 +308,8 @@ __device__ __forceinline__ float ggx_E(float mu, float alpha) {
     float b = c_ealb[jy*NE+ix]*(1.0f-dx) + c_ealb[jy*NE+jx]*dx;
     return fmaxf(1e-3f, a*(1.0f-dy) + b*dy);
 }
-// Turquin 2019: scale the single-scattering lobe to put back the energy
-// that multiple microsurface bounces would have carried. For F0=1 this is
-// exactly 1/E, so a white rough metal becomes perfectly energy preserving.
+// Turquin 2019 multiple-scattering compensation. For F0=1 the factor is
+// 1/E, so a white rough metal passes the furnace test.
 __device__ __forceinline__ Spec ms_comp(Spec f0, float mu, float alpha) {
     float k = (1.0f - ggx_E(mu, alpha)) / ggx_E(mu, alpha);
     Spec r;
@@ -366,9 +362,8 @@ __device__ Spec bsdf_eval(int type, Spec alb, float alpha, float ior,
         float spec = Fm * D * G2 / (4.0f * wo.z) * ms_comp1(f0, wo.z, alpha);
         float Fo = f0 + (1.0f - f0)*__powf(1.0f - wo.z, 5.0f);
         float Fi = f0 + (1.0f - f0)*__powf(1.0f - wi.z, 5.0f);
-        // Divide by (1 - Fdr) to account for light the coat reflects back
-        // down and the base gets a second go at. Fdr is the cosine-weighted
-        // average of Schlick, which integrates to f0 + (1-f0)/21 exactly.
+        // /(1 - Fdr) for light the coat bounces back down to the base.
+        // Fdr = cosine-weighted avg of schlick = f0 + (1-f0)/21.
         float Fdr = f0 + (1.0f - f0)*(1.0f/21.0f);
         Spec diff = sp_scale(alb, (1.0f-Fo)*(1.0f-Fi)*INV_PI*wi.z/(1.0f - Fdr));
         float ps = fminf(0.95f, fmaxf(0.05f, Fo/(Fo + (1.0f-Fo)*fmaxf(sp_avg(alb),0.02f))));
@@ -477,9 +472,8 @@ __device__ __forceinline__ float power_heuristic(float a, float b) {
     return a2 / fmaxf(a2 + b2, 1e-20f);
 }
 
-// Shadow ray. Thin films are not opaque: the ray passes through them and
-// picks up their transmittance, which keeps soft shadows under a bubble
-// from having to rely on chance BSDF hits.
+// Shadow ray. Passes through thin films (multiplying in their
+// transmittance) so shadows under the bubble don't depend on BSDF hits.
 __device__ bool shadow(V3 o, V3 d, int target, const SpecCtx &sc,
                        const Material* __restrict__ mats, Spec &trans) {
     trans = sp_set(1.0f);
@@ -622,9 +616,8 @@ extern "C" __global__ void render(
             // ---- delta surfaces: dielectric and thin film ---------------
             if (m.type == M_DIELECTRIC) {
                 if (m.abbe > 0.0f && secondary_alive) {
-                    // Refraction bends each wavelength differently, so the
-                    // companions can no longer share this path. Drop them and
-                    // reweight the hero (pbrt's TerminateSecondary).
+                    // dispersion: wavelengths split here, keep only the hero
+                    // and reweight (same as pbrt's TerminateSecondary)
                     T.v[0] *= (float)NL;
 #pragma unroll
                     for (int i=1;i<NL;i++) T.v[i] = 0.0f;
@@ -654,8 +647,8 @@ extern "C" __global__ void render(
                 Spec R;
 #pragma unroll
                 for (int i=0;i<NL;i++) R.v[i] = thinfilm_R(ci, m.ior, th, sc.lam[i]);
-                // Choose using the mean over live wavelengths, never the hero
-                // alone: at a hero null the companions would never reflect.
+                // use the mean over live wavelengths, not just the hero,
+                // otherwise a hero null means the others never reflect
                 float Pr = 0.0f; int live = 0;
 #pragma unroll
                 for (int i=0;i<NL;i++) if (T.v[i] != 0.0f) { Pr += R.v[i]; live++; }
@@ -671,9 +664,8 @@ extern "C" __global__ void render(
                     for (int i=0;i<NL;i++) T.v[i] *= (1.0f - R.v[i])/(1.0f - Pr);
                     nd = d;                            // a film does not refract
                 }
-                // Deliberately leave prev_delta/prev_pdf/prev_p alone: a film
-                // does not bend the ray, so for MIS the path still looks as
-                // though it came straight from the previous real vertex.
+                // prev_* left alone on purpose: the film doesn't bend the ray,
+                // so for MIS the previous real vertex is still the right one
                 o = add(p, mul(fn, dot3(nd, fn) > 0.0f ? RAY_EPS : -RAY_EPS));
                 d = nd;
                 continue;

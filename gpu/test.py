@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Correctness tests. These run before any pretty picture is trusted."""
+"""Correctness tests: furnace, MIS consistency, colour round-trip."""
 import sys, os
 import numpy as np, cupy as cp
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -12,8 +12,7 @@ def check(name, got, want, tol, note=""):
     print(f"  [{'PASS' if ok else 'FAIL'}] {name:34} {got:9.5f}  (want {want} +-{tol}) {note}")
     if not ok: FAIL.append(name)
 
-print("white furnace test -- albedo-1 object in a sky of radiance 1")
-print("  every pixel must read exactly 1.0, or energy is being lost/created")
+print("furnace test (albedo 1, sky 1, expect 1.0)")
 for kind, tol, note in [("diffuse", 0.004, ""), ("glass", 0.004, ""),
                         ("dispersive", 0.006, "hero-wavelength reweighting"),
                         ("film", 0.004, "thin-film R+T=1"),
@@ -24,7 +23,7 @@ for kind, tol, note in [("diffuse", 0.004, ""), ("glass", 0.004, ""),
     v = cp.asnumpy(hdr).mean()
     check(f"furnace {kind}", float(v), 1.0, tol, note)
 
-print("\nMIS consistency -- three estimators, same integral")
+print("\nMIS vs NEE-only vs BSDF-only")
 means = {}
 for mode, label in [(0, "MIS"), (1, "BSDF-sampling only"), (2, "NEE only")]:
     hdr, st = R.render(SC.mistest(), 256, 144, max_spp=3072, min_spp=3072,
@@ -37,7 +36,7 @@ for k, v in means.items():
     if k != "MIS":
         check(f"{k} vs MIS", v/ref, 1.0, 0.02)
 
-print("\ncolour round-trip -- emitter RGB must survive the spectral pipeline")
+print("\nemitter colour round-trip")
 s = SC.Scene("rt")
 s.cam = dict(frm=(0,0,3), at=(0,0,0), vfov=30.0, aperture=0.0, focus=None)
 s.sky = ((0,0,0),(0,0,0))

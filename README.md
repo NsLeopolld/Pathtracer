@@ -1,25 +1,23 @@
 # Path tracer
 
-A physically based renderer, written three times: once in NumPy, once in C,
-once in CUDA. Each version is a rewrite of the one before it, and the
-benchmark between them is fair because they trace byte-identical geometry.
+A path tracer I wrote three times: NumPy first, then C, then CUDA. The NumPy
+and C versions trace the same geometry (scene.h is generated from the Python
+scene), so the benchmarks between them compare like for like.
 
-All three write their own PNG files — chunk framing, CRC-32 and adaptive
-scanline filtering, assembled from the bytes up. No image library is used
-anywhere, in any of them.
+None of them use an image library. PNG writing (chunks, CRC, scanline
+filtering) is done by hand, with zlib only for deflate.
 
 ![Neon night, rendered with the CUDA version](render_gpu_neon.png)
 
-The soap bubble's iridescence above is not a texture or a gradient. It is
-thin-film interference, computed from the film's thickness and the
-wavelength of the light hitting it. The RGB renderers in this repo cannot
-express it at all; the spectral one gets it for free.
+The colours on the bubble come from actual thin-film interference, computed
+per wavelength from the film thickness. That's the main reason the CUDA
+version is spectral; the RGB versions can't do it.
 
 ---
 
 ## Quick start
 
-### C (start here — fastest to run, no setup)
+### C (fastest to get running, no setup)
 
 ```sh
 gcc -O3 -march=native -ffast-math -funroll-loops -fopenmp -Wall -Wextra \
@@ -27,7 +25,7 @@ gcc -O3 -march=native -ffast-math -funroll-loops -fopenmp -Wall -Wextra \
 ./pathtracer --width 960 --spp 144 --depth 16 --out render.png
 ```
 
-Other scenes are separate builds, selected at compile time:
+Other scenes are picked at compile time:
 
 ```sh
 python3 make_scenes.py                      # writes scene.h, scene_cornell.h, scene_neon.h
@@ -35,20 +33,19 @@ gcc -O3 -march=native -ffast-math -fopenmp \
     -DSCENE_FILE='"scene_cornell.h"' pathtracer.c -lz -lm -o pathtracer_cornell
 ```
 
-Flags: `--width --height --spp --depth --out`. Set `OMP_NUM_THREADS` to control
-threading, and `NO_NEE=1` to disable light sampling (used for the A/B in
-"What didn't work").
+Flags: `--width --height --spp --depth --out`. Thread count comes from
+`OMP_NUM_THREADS`.
 
-### NumPy (the reference implementation)
+### NumPy
 
 ```sh
 python3 pathtracer.py --width 480 --spp 32 --out render.png
 ```
 
-Slow — see the table below — but it is the definition the C version was
-checked against.
+Slow (see below), but it's the reference I checked the C version against.
+`NO_NEE=1` turns off light sampling in this version.
 
-### CUDA (spectral; needs an NVIDIA GPU)
+### CUDA (spectral, needs an NVIDIA GPU)
 
 ```sh
 .venv/bin/python gpu/render.py --scene neon  --width 1920 --spp 4096 --max-time 180
@@ -56,30 +53,30 @@ checked against.
 .venv/bin/python gpu/render.py --scene cornell --width 1200 --height 1200 --spp 8192
 ```
 
-See [Setup](#setup-for-the-cuda-version) for the environment. Scenes:
-`hero`, `cornell`, `neon`, plus the test scenes `mistest` and `furnace-*`.
+Environment setup is [below](#setup-for-the-cuda-version). Scenes: `hero`,
+`cornell`, `neon`, and the test scenes `mistest` and `furnace-*`.
 
 ---
 
 ## Results
 
-Same scene and same geometry throughout. Measured on an i5-10300H
-(4 cores / 8 threads, AVX2) and a GTX 1650 Mobile.
+Same scene for all three. i5-10300H (4C/8T, AVX2) and a GTX 1650 Mobile.
 
 | Renderer | Throughput | Relative | 960×540 @ 144 spp |
 |---|---:|---:|---:|
 | NumPy, 8 processes | 0.29 Msamples/s | 1× | 257.9 s |
-| C, AVX2, 8 threads | 7.74 Msamples/s | **26.8×** | 9.6 s |
-| CUDA, GTX 1650 | 112–139 Msamples/s | **~390×** | — |
+| C, AVX2, 8 threads | 7.74 Msamples/s | 26.8× | 9.6 s |
+| CUDA, GTX 1650 | 112–139 Msamples/s | ~390× | — |
 
-Per core the C version is roughly **43×** the NumPy one. That gap is not
-only the language: NumPy forces a worse algorithm shape. Per-ray Python is
-hopeless, so the whole frame has to advance one bounce at a time, streaming
-every live ray through memory at every bounce. C carries one path to
-completion in registers and touches nothing outside L1.
+Per core, C is about 43× faster than NumPy. Part of that is the language,
+but mostly it's the structure: to get any speed out of NumPy you have to
+push the whole frame through one bounce at a time, which means streaming
+every live ray through memory on every bounce. The C version just traces
+one path at a time and stays in cache.
 
-CUDA is ~14.5× the C version *while doing considerably more work per
-sample* — four wavelengths per path, MIS, microfacet metals.
+CUDA is ~14.5× the C version, and it does more work per sample (4
+wavelengths per path, MIS, microfacet metals), so the numbers aren't
+directly comparable.
 
 ### Thread scaling (C)
 
@@ -90,50 +87,46 @@ sample* — four wavelengths per path, MIS, microfacet metals.
 | 4 | 2.78 s | 3.81× | 95% |
 | 8 | 2.17 s | 4.88× | 61% |
 
-95% efficiency on the 4 physical cores. The drop at 8 is hyperthreading:
-the second thread on a core shares execution units this workload already
-saturates.
+Scales well up to the 4 physical cores. Going to 8 threads only helps a
+bit since hyperthreads share the same execution units.
 
 ---
 
 ## How they work
 
-**NumPy** (`pathtracer.py`) — vectorised across rays. Cone-sampled
-next-event estimation, Schlick dielectrics, glossy metals, thin-lens depth
-of field, Russian roulette, ACES tonemap.
+**NumPy** (`pathtracer.py`): vectorised over rays. NEE with cone sampling
+toward sphere lights, Schlick dielectrics, fuzzy metals, thin lens DOF,
+Russian roulette, ACES tonemap.
 
-**C** (`pathtracer.c`) — same algorithm, one path at a time. The sphere
-intersection loop is written branchless so gcc vectorises it into AVX2
-(`vfmadd132ps`, `vblendvps`); it tests 8 spheres per instruction. Lights are
+**C** (`pathtracer.c`): same algorithm, one path at a time. The sphere
+intersection loop is branchless so gcc vectorises it with AVX2
+(`vfmadd132ps`/`vblendvps`, 8 spheres per iteration). Lights are
 picked proportional to power / distance². Geometry comes from `scene.h`,
-generated out of the NumPy scene so the two renderers agree.
+which is generated from the NumPy scene.
 
-**CUDA** (`gpu/`) — a spectral path tracer. Four wavelengths per path
-(hero wavelength sampling), which is what makes dispersion and thin-film
-interference possible at all. Also: MIS between light and BSDF sampling
-with the power heuristic, GGX metals with Turquin energy compensation,
-coated-diffuse surfaces, adaptive sampling, AgX tonemapping, lens glare and
-dithered output. Compiled at runtime by NVRTC.
+**CUDA** (`gpu/`): spectral. 4 wavelengths per path (hero wavelength
+sampling), which is what dispersion and thin film need. Also has MIS
+between light and BSDF sampling (power heuristic), GGX metals with Turquin
+energy compensation, coated diffuse, adaptive sampling, AgX tonemapping,
+glare and dithering. The kernel is compiled at runtime with NVRTC.
 
-RGB scene colours are turned into spectra with a basis solved by
-constrained optimisation (Mallett & Yuksel 2019): three smooth curves that
-sum to 1 at every wavelength, stay within [0,1], and round-trip RGB
-exactly. Summing to one is what makes reflectance upsampling
-energy-conserving — a surface can never reflect more than it receives.
+RGB colours are converted to spectra with a basis from Mallett & Yuksel
+2019, solved with constrained optimisation: three smooth curves that sum to
+1 at every wavelength, stay in [0,1], and round-trip RGB exactly. The
+sum-to-one part is what keeps reflectances from going above 1 at any
+wavelength.
 
 ---
 
 ## Correctness
 
-The GPU renderer is tested, not assumed:
-
 ```sh
 .venv/bin/python gpu/test.py
 ```
 
-**White furnace test.** Put an albedo-1 object in a sky of radiance 1. It
-must vanish — every pixel exactly 1.0. Anything else means energy is being
-lost or invented.
+**White furnace.** An albedo-1 object in a uniform sky of radiance 1 should
+disappear, i.e. every pixel reads 1.0. If it doesn't, energy is being lost
+or added somewhere.
 
 | Material | Result |
 |---|---:|
@@ -144,51 +137,49 @@ lost or invented.
 | Rough conductor | 0.9999 |
 | Coated diffuse | 0.9790 |
 
-Dispersive glass passing is the meaningful one: it confirms the
-hero-wavelength reweighting is unbiased. Rough conductor started at 0.888 —
-the standard single-scattering microfacet loss — and the energy
-compensation in `gpu/ggx_albedo.py` fixed it.
+Dispersive glass passing means the hero wavelength reweighting is right.
+Rough conductor was at 0.888 before energy compensation
+(`gpu/ggx_albedo.py`), which is the usual single-scattering GGX loss.
 
-**Estimator agreement.** MIS, NEE-only and BSDF-only are three different
-ways to compute the same integral. They agree to **0.02%**, with MIS the
-least noisy (1.23× under BSDF-only).
+**Estimator agreement.** MIS, NEE only and BSDF only should all converge to
+the same image. They agree within 0.02%, and MIS has the least noise (1.23×
+lower than BSDF only).
 
-**Colour round-trip.** Emitter RGB survives RGB → spectrum → RGB to within
-0.0005.
+**Colour round-trip.** Emitter RGB → spectrum → RGB is off by at most 0.0005.
 
-The supporting tables verify themselves too: `gpu/sobol.py` checks the
-(0,m,2)-net property rather than trusting the direction numbers, and
-`gpu/spectral.py` reports round-trip error (2e-16) and basis bounds.
+The table generators check themselves as well: `gpu/sobol.py` tests the
+(0,m,2)-net property, and `gpu/spectral.py` prints the round-trip error
+(2e-16) and basis bounds.
 
 ---
 
 ## What didn't work
 
-Both of these are measured, and both are kept in the repo because the
-result is scene-dependent rather than universal.
+Both of these are still in the repo since whether they help depends on the
+scene.
 
-**Owen-scrambled Sobol sampling** is 1.1× better per sample but roughly 50%
-slower, so at equal *time* plain PRNG wins. Error here is dominated by
-high-dimensional caustic paths, where low-discrepancy sampling gives
-nothing. Default off; `--ld-groups 8` turns it on.
+**Owen-scrambled Sobol.** About 1.1× better per sample but ~50% slower, so
+at equal render time plain PRNG wins. Most of the error in these scenes is
+from caustic paths, where low-discrepancy sampling doesn't help much. Off
+by default, `--ld-groups 8` enables it.
 
-**Adaptive sampling** was initially 55% *slower* than uniform, because as
-pixels converge the launches shrink and become latency-bound. Sizing each
-launch to a constant work quantum brought it to roughly break-even (~2%
-ahead). On by default; `--no-adaptive` disables it.
+**Adaptive sampling.** First version was 55% slower than uniform, because
+once most pixels converge the launches get tiny and latency dominates.
+Sizing each launch to a fixed amount of work got it to roughly break-even
+(~2% ahead). On by default, `--no-adaptive` disables it.
 
-Run them yourself: `gpu/bench.py` (equal sample count) and `gpu/bench2.py`
-(equal time — the one that decides anything).
+Benchmarks: `gpu/bench.py` (equal spp) and `gpu/bench2.py` (equal time,
+which is the fairer comparison).
 
 ---
 
 ## Setup for the CUDA version
 
-Needs an NVIDIA GPU and driver. Nothing is installed system-wide; the whole
-toolchain comes from pip, and `rm -rf .venv` reverses it.
+Needs an NVIDIA GPU and driver. Everything else comes from pip into a venv,
+nothing system-wide. `rm -rf .venv` to undo.
 
 ```sh
-python3 -m venv --without-pip .venv        # Debian: ensurepip is often absent
+python3 -m venv --without-pip .venv        # Debian often lacks ensurepip
 python3 -m pip --python .venv/bin/python install \
     cupy-cuda12x numpy scipy pillow \
     "nvidia-cuda-nvrtc-cu12==12.4.*" "nvidia-cuda-runtime-cu12==12.4.*" \
@@ -196,10 +187,10 @@ python3 -m pip --python .venv/bin/python install \
     "nvidia-cublas-cu12==12.4.*"
 ```
 
-**Pin NVRTC to your driver's CUDA version** (`nvidia-smi` reports it, top
-right). A newer NVRTC emits PTX an older driver cannot load.
+Pin NVRTC to the CUDA version your driver supports (top right of
+`nvidia-smi`). A newer NVRTC produces PTX that an older driver can't load.
 
-The lookup tables are committed, but regenerate with:
+The lookup tables are committed. To regenerate:
 
 ```sh
 .venv/bin/python gpu/spectral.py     # RGB -> spectrum basis
@@ -207,43 +198,43 @@ The lookup tables are committed, but regenerate with:
 .venv/bin/python gpu/ggx_albedo.py   # GGX directional albedo
 ```
 
-`.venv` is ~1.6 GB, almost all of it CUDA libraries.
+The venv ends up around 1.6 GB, nearly all CUDA libraries.
 
 ---
 
 ## Layout
 
 ```
-pathtracer.py        NumPy renderer; also defines the shared scene
+pathtracer.py        NumPy renderer, also defines the default scene
 pathtracer.c         C renderer
 make_scenes.py       writes scene.h, scene_cornell.h, scene_neon.h
 gpu/kernel.cu        spectral path tracer (CUDA)
-gpu/render.py        host: scene upload, adaptive loop, post, PNG
-gpu/scenes.py        scene definitions, including the test scenes
+gpu/render.py        host side: scene upload, adaptive loop, post, PNG
+gpu/scenes.py        scene definitions, including test scenes
 gpu/test.py          furnace / MIS / colour tests
-gpu/bench.py         equal-sample-count benchmark
+gpu/bench.py         equal-spp benchmark
 gpu/bench2.py        equal-time benchmark
 gpu/spectral.py      solves the RGB -> spectrum basis
-gpu/sobol.py         Sobol direction numbers, with net-property tests
-gpu/ggx_albedo.py    GGX directional albedo, for energy compensation
+gpu/sobol.py         Sobol direction numbers + net-property tests
+gpu/ggx_albedo.py    GGX directional albedo for energy compensation
 render*.png          output
 ```
 
 Generated headers and lookup tables are committed so a fresh clone builds
-and runs; every one of them regenerates byte-for-byte identical.
+without running the generators first.
 
 ---
 
 ## Known limitations
 
-- **Spheres and planes only.** No triangles, so no meshes. With scenes this
-  small a linear SIMD scan beats a BVH, which is why there isn't one.
-- **Caustic noise.** Light paths through glass cannot be reached by shadow
-  rays, so caustics converge slowly. The honest fix is samples; the
-  dishonest one is `--clamp`, which is biased and off by default.
-- **Coated diffuse loses 2.1%** of its energy — the coat coupling is
-  approximate. It errs toward losing light rather than creating it.
-- **No denoiser.** Every image here is converged, not filtered.
-- **Spectral upsampling is not unique.** Infinitely many spectra share an
-  RGB value; this basis picks the smoothest energy-conserving one, which is
-  a defensible choice rather than a recovery of ground truth.
+- **Spheres and planes only.** No triangles or meshes. For scenes this
+  small a linear SIMD loop is faster than a BVH, so there isn't one.
+- **Caustics are noisy.** Shadow rays can't reach lights through glass, so
+  caustics converge slowly. `--clamp` cuts the fireflies but adds bias, so
+  it's off by default.
+- **Coated diffuse loses 2.1%** of its energy since the coat/base coupling
+  is approximate. At least it loses energy rather than creating it.
+- **No denoiser.** All the renders here are just run to convergence.
+- **Spectral upsampling isn't unique.** Lots of spectra map to the same
+  RGB. This basis picks the smoothest energy-conserving one, which is a
+  reasonable choice but not "the" spectrum.

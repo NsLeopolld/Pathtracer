@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Measure the three efficiency claims against a converged reference."""
+"""Sobol vs PRNG and adaptive vs uniform, RMSE against an 8192 spp reference."""
 import sys, os, time
 import numpy as np, cupy as cp
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))

@@ -1,17 +1,11 @@
 /*
- * pathtracer.c -- the Python renderer, rewritten in C.
+ * C port of pathtracer.py. Same scene (scene.h), camera and algorithm, so
+ * the two can be benchmarked against each other.
  *
- * Same scene (generated into scene.h), same camera, same algorithm: cone-
- * sampled next-event estimation, Schlick dielectrics, glossy metal, thin-lens
- * depth of field, Russian roulette, ACES tonemap, and a PNG encoder built
- * from the spec up. Only the execution model changes.
- *
- * The numpy version had to vectorize ACROSS rays -- advance every ray one
- * bounce at a time -- because per-ray Python is hopeless. That costs memory
- * bandwidth: each bounce streams the whole live ray set through RAM. C can
- * do the natural thing instead: carry one path to completion in registers,
- * touching nothing but L1. The sphere loop is laid out struct-of-arrays so
- * gcc auto-vectorizes it into AVX2, testing 8 spheres per instruction.
+ * Main difference: the numpy version pushes all rays through one bounce at
+ * a time, which streams the whole ray set through memory every bounce.
+ * Here each path is traced start to finish. Sphere data is SoA so gcc can
+ * vectorize the intersection loop (AVX2 with -march=native).
  *
  *   cc -O3 -march=native -ffast-math -fopenmp pathtracer.c -lz -lm -o pathtracer
  */
@@ -32,7 +26,7 @@
 #endif
 #include SCENE_FILE
 
-/* Per-scene knobs. A scene header may define any of these to override. */
+/* defaults, scene headers can override any of these */
 #ifndef CAM_FROM
 #define CAM_FROM      8.6f, 2.15f, 6.2f
 #endif
@@ -52,7 +46,7 @@
 #define SKY_ZENITH    0.10f, 0.16f, 0.30f
 #endif
 #ifndef FLOOR_CHECKER
-#define FLOOR_CHECKER 1          /* shade sphere 0 with the procedural checker */
+#define FLOOR_CHECKER 1          /* checker on sphere 0 */
 #endif
 #ifndef EXPOSURE
 #define EXPOSURE      1.0f
@@ -60,15 +54,12 @@
 
 #define PI 3.14159265358979323846f
 
-/* Ray offset, applied along the surface normal. Walls are radius-1000
- * spheres, and in float32 |oc|^2 - r^2 carries ~0.06 of rounding error;
- * 1e-4 was below that, so grazing rays re-hit the surface they left and
- * drew concentric rings. 1e-3 clears it and is invisible at room scale. */
+/* Offset along the normal for new rays. Was 1e-4, but with the r=1000
+ * wall spheres |oc|^2 - r^2 has ~0.06 of float error and grazing rays
+ * re-hit their own surface (ring artifacts). 1e-3 fixes it. */
 #define RAY_EPS 1e-3f
 
-/* ------------------------------------------------------------------ */
-/* Vector math                                                         */
-/* ------------------------------------------------------------------ */
+/* ---- vec3 ---- */
 
 typedef struct { float x, y, z; } Vec3;
 
@@ -88,10 +79,7 @@ static inline float vmaxc(Vec3 a) {
     float m = a.x > a.y ? a.x : a.y; return m > a.z ? m : a.z;
 }
 
-/* ------------------------------------------------------------------ */
-/* PCG32 -- small, fast, and seeded per pixel so the image is          */
-/* bit-identical no matter how many threads render it.                 */
-/* ------------------------------------------------------------------ */
+/* ---- rng: PCG32, seeded per pixel ---- */
 
 typedef struct { uint64_t state, inc; } Rng;
 
@@ -108,12 +96,11 @@ static inline void rng_seed(Rng *r, uint64_t seq, uint64_t seed) {
     pcg32(r); r->state += seed; pcg32(r);
 }
 
-/* 24 random bits scaled into [0,1) -- no division, no rejection loop. */
+/* top 24 bits -> [0,1) */
 static inline float randf(Rng *r) { return (float)(pcg32(r) >> 8) * 0x1.0p-24f; }
 
 static inline Vec3 random_unit(Rng *r) {
-    /* Rejection sampling in the cube beats trig here: ~52% accept rate,
-     * but each attempt is 3 multiplies instead of two sin/cos calls. */
+    /* rejection sampling, ~52% accept but cheaper than sin/cos */
     for (;;) {
         Vec3 p = v3(randf(r)*2.0f-1.0f, randf(r)*2.0f-1.0f, randf(r)*2.0f-1.0f);
         float l2 = vlen2(p);
@@ -121,9 +108,7 @@ static inline Vec3 random_unit(Rng *r) {
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* Scene, struct-of-arrays so the hot loop vectorizes                  */
-/* ------------------------------------------------------------------ */
+/* ---- scene (SoA for the intersect loop) ---- */
 
 static float g_cx[N_SPHERES], g_cy[N_SPHERES], g_cz[N_SPHERES];
 static float g_r[N_SPHERES],  g_r2[N_SPHERES], g_inv_r[N_SPHERES];
@@ -131,7 +116,7 @@ static float g_ar[N_SPHERES], g_ag[N_SPHERES], g_ab[N_SPHERES];
 static int   g_mat[N_SPHERES];
 static float g_param[N_SPHERES];
 static int   g_lights[N_SPHERES], g_nlights = 0;
-static float g_power[N_SPHERES];   /* luminance * r^2: emitted-power proxy */
+static float g_power[N_SPHERES];   /* luminance * r^2, rough light power */
 
 static void scene_init(void) {
     for (int i = 0; i < N_SPHERES; i++) {
@@ -145,17 +130,14 @@ static void scene_init(void) {
     }
 }
 
-/*
- * Closest-hit over every sphere. Written branchless on purpose: the selects
- * become vblendvps, so gcc unrolls this into AVX2 lanes and tests 8 spheres
- * per iteration instead of branching once per sphere.
- */
+/* Closest hit. Kept branchless so gcc vectorizes it (selects -> blends),
+ * don't add early-outs here. */
 static inline int intersect(Vec3 o, Vec3 d, float tmin, float *out_t) {
     float best = INFINITY;
     int   id   = -1;
     for (int i = 0; i < N_SPHERES; i++) {
         float ox = o.x - g_cx[i], oy = o.y - g_cy[i], oz = o.z - g_cz[i];
-        float hb = d.x*ox + d.y*oy + d.z*oz;          /* dir is unit => a == 1 */
+        float hb = d.x*ox + d.y*oy + d.z*oz;          /* |d| == 1 so a == 1 */
         float c  = ox*ox + oy*oy + oz*oz - g_r2[i];
         float disc = hb*hb - c;
         float s  = sqrtf(disc > 0.0f ? disc : 0.0f);
@@ -182,15 +164,10 @@ static inline Vec3 checker(Vec3 p) {
     return s > 0.0f ? v3(0.62f, 0.60f, 0.58f) : v3(0.14f, 0.15f, 0.17f);
 }
 
-/* ------------------------------------------------------------------ */
-/* Next-event estimation: pick a light, aim a shadow ray into the cone */
-/* it subtends. pdf = 1 / (2*pi*(1 - cos theta_max)) in solid angle.   */
-/*                                                                     */
-/* Lights are picked with probability ~ power / distance^2 from THIS   */
-/* shading point, so a dim orb 15 units away no longer gets the same   */
-/* share of shadow rays as a bright one next door. Unbiased because    */
-/* the estimate divides by the exact pick probability.                 */
-/* ------------------------------------------------------------------ */
+/* ---- NEE ----
+ * Pick a light with prob ~ power / dist^2 from p, then sample the cone it
+ * subtends: pdf = 1 / (2*pi*(1 - cos_max)). With uniform picking a dim
+ * light far away got as many shadow rays as a bright one close by. */
 
 static Vec3 sample_lights(Vec3 p, Vec3 n, Vec3 albedo, Rng *rng) {
     const Vec3 zero = v3(0.0f, 0.0f, 0.0f);
@@ -227,23 +204,21 @@ static Vec3 sample_lights(Vec3 p, Vec3 n, Vec3 albedo, Rng *rng) {
     float cs = vdot(ldir, n);
     if (cs <= 1e-6f) return zero;
 
-    /* Unoccluded exactly when the nearest thing along the ray IS the light. */
+    /* visible iff the first hit is the light we picked */
     float t;
     Vec3 org = vadd(p, vscl(n, RAY_EPS));
     if (intersect(org, ldir, 1e-4f, &t) != li) return zero;
 
     float pdf = 1.0f / (2.0f * PI * fmaxf(1.0f - cos_max, 1e-9f));
-    float wgt = cs / (PI * pdf * pick_pdf);            /* BRDF=alb/pi, /pdfs */
+    float wgt = cs / (PI * pdf * pick_pdf);            /* brdf = alb/pi */
     return vscl(vmul(albedo, v3(g_ar[li], g_ag[li], g_ab[li])), wgt);
 }
 
-/* ------------------------------------------------------------------ */
-/* One path, carried to completion                                     */
-/* ------------------------------------------------------------------ */
+/* ---- path tracing ---- */
 
 static Vec3 trace(Vec3 o, Vec3 d, Rng *rng, int max_depth) {
     Vec3 L = v3(0,0,0), T = v3(1,1,1);
-    int specular = 1;   /* may a chance emitter hit count? diffuse already NEE'd */
+    int specular = 1;   /* count emitter hits? (not after diffuse, NEE has it) */
 
     for (int depth = 0; depth < max_depth; depth++) {
         float t;
@@ -251,7 +226,7 @@ static Vec3 trace(Vec3 o, Vec3 d, Rng *rng, int max_depth) {
         if (id < 0) { L = vadd(L, vmul(T, sky(d))); break; }
 
         Vec3 p = vadd(o, vscl(d, t));
-        /* Dividing by the SIGNED radius flips normals on the hollow shell. */
+        /* signed radius -> inward normals for the hollow shell */
         Vec3 nrm = vscl(vsub(p, v3(g_cx[id], g_cy[id], g_cz[id])), g_inv_r[id]);
         int front = vdot(d, nrm) < 0.0f;
         Vec3 fn = front ? nrm : vneg(nrm);
@@ -293,7 +268,7 @@ static Vec3 trace(Vec3 o, Vec3 d, Rng *rng, int max_depth) {
             specular = 1;
         }
 
-        /* Leave along the normal, to whichever side the new ray heads. */
+        /* offset to whichever side the new ray is going */
         o = vadd(p, vscl(fn, vdot(nd, fn) > 0.0f ? RAY_EPS : -RAY_EPS));
         d = nd;
 
@@ -306,9 +281,7 @@ static Vec3 trace(Vec3 o, Vec3 d, Rng *rng, int max_depth) {
     return L;
 }
 
-/* ------------------------------------------------------------------ */
-/* Camera                                                              */
-/* ------------------------------------------------------------------ */
+/* ---- camera ---- */
 
 static Vec3 cam_origin, cam_u, cam_v, cam_horiz, cam_vert, cam_ll;
 static float cam_lens;
@@ -330,16 +303,14 @@ static void camera_init(Vec3 from, Vec3 at, Vec3 vup, float vfov,
 
 static inline void camera_ray(float s, float t, Rng *rng, Vec3 *o, Vec3 *d) {
     float ang = randf(rng) * 2.0f * PI;
-    float rad = cam_lens * sqrtf(randf(rng));       /* uniform on the lens disc */
+    float rad = cam_lens * sqrtf(randf(rng));       /* uniform on disc */
     Vec3 off = vadd(vscl(cam_u, rad*cosf(ang)), vscl(cam_v, rad*sinf(ang)));
     *o = vadd(cam_origin, off);
     Vec3 target = vadd(vadd(cam_ll, vscl(cam_horiz, s)), vscl(cam_vert, t));
     *d = vnorm(vsub(target, *o));
 }
 
-/* ------------------------------------------------------------------ */
-/* PNG encoder -- chunks, CRC-32 and adaptive filtering, by hand       */
-/* ------------------------------------------------------------------ */
+/* ---- PNG writer (same as the python one) ---- */
 
 static void put_be32(unsigned char *p, uint32_t v) {
     p[0]=(unsigned char)(v>>24); p[1]=(unsigned char)(v>>16);
@@ -358,8 +329,7 @@ static void write_chunk(FILE *f, const char *kind, const unsigned char *data, si
     fwrite(hdr, 1, 4, f);
 }
 
-/* Score a filtered row: bytes near zero (either end of the signed range)
- * are what DEFLATE packs best, so sum min(b, 256-b) and keep the smallest. */
+/* sum of abs values, bytes treated as signed. lowest cost wins */
 static long filter_cost(const unsigned char *row, size_t n) {
     long c = 0;
     for (size_t i = 0; i < n; i++) { int b = row[i]; c += b < 128 ? b : 256 - b; }
@@ -399,7 +369,7 @@ static size_t write_png(const char *path, const unsigned char *rgb, int w, int h
         prev = cur;
     }
 
-    /* Z_FILTERED matches what the Python version asks zlib for. */
+    /* same zlib settings as pathtracer.py */
     z_stream zs; memset(&zs, 0, sizeof zs);
     deflateInit2(&zs, 9, Z_DEFLATED, 15, 9, Z_FILTERED);
     size_t cap = deflateBound(&zs, raw_len);
@@ -430,7 +400,7 @@ static size_t write_png(const char *path, const unsigned char *rgb, int w, int h
     return total;
 }
 
-/* ------------------------------------------------------------------ */
+/* ---- main ---- */
 
 static inline float aces(float x) {
     const float a=2.51f, b=0.03f, c=2.43f, d=0.59f, e=0.14f;
@@ -472,12 +442,12 @@ int main(int argc, char **argv) {
     float *acc = malloc(sizeof(float) * 3 * (size_t)width * (size_t)height);
     double t0 = now_sec();
 
-    /* Dynamic scheduling: glass-heavy rows cost far more than empty sky. */
+    /* dynamic: rows with lots of glass are much slower than sky rows */
 #pragma omp parallel for schedule(dynamic, 4)
     for (int y = 0; y < height; y++) {
         for (int x = 0; x < width; x++) {
             Rng rng;
-            /* Seeded from the pixel, so output is thread-count independent. */
+            /* per-pixel seed so output doesn't depend on thread count */
             rng_seed(&rng, ((uint64_t)y << 20) ^ (uint64_t)x, 0x853C49E6748FEA9BULL);
             Vec3 sum = v3(0,0,0);
             for (int s = 0; s < spp; s++) {

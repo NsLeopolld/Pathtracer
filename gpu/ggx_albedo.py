@@ -2,17 +2,12 @@
 """
 Directional albedo of single-scattering GGX, E(mu, alpha), by Monte Carlo.
 
-A microfacet BRDF only models light that bounces off the microsurface once.
-Light that bounces two or more times is dropped, so rough metals come out
-too dark -- 11% too dark at alpha=0.3 in the furnace test.
-
-E is the fraction that single scattering does deliver, with Fresnel forced
-to 1. Turquin (2019) restores the rest by scaling the lobe by
+Single-scatter GGX loses the energy from multiple bounces, so rough metals
+come out dark (11% at alpha=0.3 in the furnace test). E is what single
+scattering keeps, with F=1. Used for Turquin (2019) compensation:
     1 + F0 * (1 - E(mu_o)) / E(mu_o)
-which for F0=1 becomes exactly 1/E, i.e. perfect energy preservation.
 
-Since the BRDF weight under VNDF sampling is exactly G2/G1, E is just the
-mean of that weight over sampled directions -- no integrator needed.
+With VNDF sampling the weight is G2/G1, so E is just its mean.
 """
 import numpy as np, cupy as cp
 
@@ -68,7 +63,7 @@ def build():
 if __name__ == "__main__":
     print("integrating GGX directional albedo...")
     E = build()
-    # Sanity: mirror-smooth must lose nothing; rough at grazing loses most.
+    # sanity checks: smooth should be ~1
     print(f"  E(alpha->0)              = {E[0].mean():.4f}   (want ~1.000)")
     print(f"  E(alpha=1.0, mu=1.0)     = {E[-1, -1]:.4f}")
     print(f"  E(alpha=1.0, mu->0)      = {E[-1, 0]:.4f}   (grazing keeps the most)")

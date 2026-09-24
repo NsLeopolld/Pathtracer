@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 """
-GPU spectral path tracer -- host side.
-
-Owns scene upload, the adaptive sampling loop, and the post chain
-(glare -> exposure -> AgX -> dither -> hand-rolled PNG).
+Host side of the GPU spectral path tracer: scene upload, adaptive sampling
+loop, post (glare -> exposure -> AgX -> dither -> PNG).
 """
 
 import argparse, importlib.util, os, sys, time
@@ -71,9 +69,9 @@ def render(scene, width, height, max_spp=4096, min_spp=64, chunk=16,
     active = cp.arange(npix, dtype=cp.int32)
 
     block, t0, samples, it = 128, time.perf_counter(), 0, 0
-    # Keep each launch at a roughly constant work quantum. As the active set
-    # shrinks, the per-pixel sample chunk grows to match, so launches never
-    # become small enough to be dominated by launch and sync latency.
+    # keep launches around a fixed amount of work: as fewer pixels stay
+    # active, give each one more samples per launch, otherwise launch/sync
+    # overhead dominates
     QUANTUM = 24_000_000
     while active.size:
         n = int(active.size)
@@ -126,10 +124,10 @@ AGX_INV = np.array([[1.19687900512017, -0.0980208811401368, -0.0990297440797205]
 
 
 def agx(img, look="none"):
-    """AgX tonemap (Troy Sobotka's transform, Wrensch's polynomial fit).
+    """AgX tonemap (Sobotka, polynomial fit by Wrensch).
 
-    Chosen over ACES because saturated emitters -- neon orbs -- desaturate
-    towards white cleanly instead of skewing hue as they clip."""
+    Using this over ACES because the saturated neon lights go to white
+    instead of shifting hue when they clip."""
     x = img @ cp.asarray(AGX.T)
     x = cp.clip(cp.log2(cp.maximum(x, 1e-10)), -12.47393, 4.026069)
     x = (x + 12.47393) / (4.026069 + 12.47393)
@@ -150,10 +148,9 @@ def aces(img):
 
 
 def glare(img, strength):
-    """Lens glare: convolve the HDR image with a wide multi-scale PSF.
+    """Glare: convolve with a sum of 3 gaussians (FFT), blend by strength.
 
-    Real lenses scatter a few percent of incoming light across the frame;
-    without it, very bright emitters just clip flat."""
+    Otherwise bright emitters just clip to flat white."""
     if strength <= 0:
         return img
     H, W, _ = img.shape
@@ -175,8 +172,7 @@ def glare(img, strength):
 def to_png(hdr, path, exposure=1.0, tonemap="agx", look="none", bloom=0.0):
     img = glare(hdr * exposure, bloom)
     ldr = agx(img, look) if tonemap == "agx" else aces(img)
-    # Triangular dither at +-0.5 LSB: removes banding in dark gradients
-    # without adding visible grain.
+    # triangular dither, fixes banding in dark gradients
     rng = cp.random.RandomState(1234)
     tri = (rng.random_sample(ldr.shape, dtype=cp.float32)
            - rng.random_sample(ldr.shape, dtype=cp.float32)) * 0.5
@@ -208,7 +204,7 @@ def main():
     ap.add_argument("--no-adaptive", action="store_true")
     ap.add_argument("--no-bloom", action="store_true")
     ap.add_argument("--tonemap", default="agx", choices=("agx", "aces"))
-    ap.add_argument("--ld-groups", type=int, default=0)  # measured: not worth its cost here
+    ap.add_argument("--ld-groups", type=int, default=0)  # tried sobol, wasn't worth the cost here
     ap.add_argument("--save-hdr", action="store_true")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()

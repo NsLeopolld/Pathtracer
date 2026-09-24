@@ -91,7 +91,7 @@ class Scene:
 # ====================================================================== #
 
 def hero():
-    """The original scene, with the materials upgraded to real BSDFs."""
+    """Same layout as pathtracer.py, with the GPU materials."""
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     spec = importlib.util.spec_from_file_location("pt", os.path.join(root, "pathtracer.py"))
     pt = importlib.util.module_from_spec(spec); spec.loader.exec_module(pt)
@@ -103,17 +103,17 @@ def hero():
     s.sky = ((0.52, 0.42, 0.38), (0.10, 0.16, 0.30))
     s.bloom, s.exposure, s.look = 0.02, 1.0, "punchy"
 
-    # Floor: a real plane now, glossy rather than chalk-matte.
+    # real plane instead of the big sphere, glossy
     floor = s.mat(PLASTIC, (0.62, 0.60, 0.58), rough=0.30, ior=1.5,
                   checker=(0.14, 0.15, 0.17), cscale=1.15)
     s.plane((0, 1, 0), 0.0, floor)
 
-    for i in range(1, len(r)):                      # skip the old ground sphere
+    for i in range(1, len(r)):                      # 0 is the old ground sphere
         col = tuple(float(x) for x in a[i])
         if m[i] == 0:
             mat = s.mat(DIFFUSE, col)
         elif m[i] == 1:
-            # Gold for the hero ball, measured-ish F0; others keep their tint.
+            # big metal ball gets gold F0, small ones keep their colour
             f0 = (1.00, 0.766, 0.336) if r[i] > 0.9 else col
             mat = s.mat(CONDUCTOR, f0, rough=max(1e-4, float(p[i]) * 0.9))
         elif m[i] == 2:
@@ -195,11 +195,10 @@ def neon():
 
 # -------------------------------------------------------- test scenes --
 def furnace(kind="diffuse"):
-    """White furnace: a lone object inside a uniform sky of radiance 1.
+    """White furnace test scene: albedo-1 object in a uniform sky of 1.0.
 
-    Energy conservation says an albedo-1 object must vanish completely --
-    every pixel should read exactly 1.0. Any deviation is a bug in the
-    BSDF, the spectral normalisation, or the estimator.
+    Should render as exactly 1.0 everywhere. If not, something is losing
+    or adding energy (BSDF, spectral conversion, or the estimator).
     """
     s = Scene(f"furnace-{kind}")
     s.cam = dict(frm=(0, 0, 4), at=(0, 0, 0), vfov=30.0, aperture=0.0, focus=None)
@@ -217,7 +216,7 @@ def furnace(kind="diffuse"):
 
 
 def mistest():
-    """A diffuse floor lit by one sphere light: NEE, BSDF and MIS must agree."""
+    """One light over a floor, for checking NEE / BSDF / MIS give the same mean."""
     s = Scene("mistest")
     s.cam = dict(frm=(0, 2.0, 5.0), at=(0, 0.4, 0), vfov=35.0, aperture=0.0, focus=None)
     s.sky = ((0, 0, 0), (0, 0, 0))

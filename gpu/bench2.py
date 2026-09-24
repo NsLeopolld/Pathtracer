@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Equal-TIME comparison: the only comparison that decides anything."""
+"""Same as bench.py but at equal render time instead of equal spp."""
 import sys, os, time
 import numpy as np, cupy as cp
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
