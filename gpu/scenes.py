@@ -23,7 +23,7 @@ assert MAT_DTYPE.itemsize == 52, MAT_DTYPE.itemsize
 class Scene:
     def __init__(self, name):
         self.name = name
-        self.mats, self.spheres, self.planes = [], [], []
+        self.mats, self.spheres, self.planes, self.boxes = [], [], [], []
         self.cam = dict(frm=(0, 1, 5), at=(0, 1, 0), vfov=35.0,
                         aperture=0.0, focus=None)
         self.sky = ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0))
@@ -48,9 +48,16 @@ class Scene:
         self.spheres.append((*centre, radius, mat))
 
     def plane(self, normal, offset, mat):
+        """All points p with normal . p = offset. normal needn't be unit length."""
         n = np.array(normal, float)
-        n /= np.linalg.norm(n)
-        self.planes.append((*n, offset, mat))
+        length = np.linalg.norm(n)
+        self.planes.append((*(n / length), offset / length, mat))
+
+    def box(self, centre, size, mat, rot_y=0.0):
+        """Box from its centre and full size, turned rot_y degrees around y."""
+        a = np.radians(rot_y)
+        half = np.asarray(size, float) / 2
+        self.boxes.append((*centre, np.cos(a), *half, np.sin(a), mat))
 
     # -- packing ---------------------------------------------------------
     def pack(self):
@@ -59,6 +66,9 @@ class Scene:
         pln = (np.array([p[:4] for p in self.planes], np.float32).reshape(-1, 4)
                if self.planes else np.zeros((0, 4), np.float32))
         pmat = np.array([p[4] for p in self.planes], np.int32)
+        # two float4 per box: (centre, cos rot), (half size, sin rot)
+        box = np.array([b[:8] for b in self.boxes], np.float32).reshape(-1, 4)
+        bmat = np.array([b[8] for b in self.boxes], np.int32)
         mats = np.array(self.mats, MAT_DTYPE)
 
         lights, power = [], []
@@ -68,7 +78,7 @@ class Scene:
                 lum = 0.2126*m["cr"] + 0.7152*m["cg"] + 0.0722*m["cb"]
                 lights.append(i)
                 power.append(float(lum) * s[3] ** 2)
-        return dict(sph=sph, smat=smat, pln=pln, pmat=pmat, mats=mats,
+        return dict(sph=sph, smat=smat, pln=pln, pmat=pmat, box=box, bmat=bmat, mats=mats,
                     lights=np.array(lights, np.int32),
                     power=np.array(power, np.float32))
 
@@ -194,13 +204,13 @@ def neon():
 
 
 # -------------------------------------------------------- test scenes --
-def furnace(kind="diffuse"):
+def furnace(kind="diffuse", shape="sphere"):
     """White furnace test scene: albedo-1 object in a uniform sky of 1.0.
 
     Should render as exactly 1.0 everywhere. If not, something is losing
     or adding energy (BSDF, spectral conversion, or the estimator).
     """
-    s = Scene(f"furnace-{kind}")
+    s = Scene(f"furnace-{kind}" + ("" if shape == "sphere" else f"-{shape}"))
     s.cam = dict(frm=(0, 0, 4), at=(0, 0, 0), vfov=30.0, aperture=0.0, focus=None)
     s.sky = ((1, 1, 1), (1, 1, 1))
     mats = dict(
@@ -211,7 +221,10 @@ def furnace(kind="diffuse"):
         film=lambda: s.mat(THINFILM, (1, 1, 1), ior=1.33, film=420.0),
         plastic=lambda: s.mat(PLASTIC, (1, 1, 1), rough=0.2),
     )
-    s.sphere((0, 0, 0), 1.0, mats[kind]())
+    if shape == "box":
+        s.box((0, 0, 0), (1.4, 1.4, 1.4), mats[kind](), rot_y=30.0)
+    else:
+        s.sphere((0, 0, 0), 1.0, mats[kind]())
     return s
 
 
@@ -227,6 +240,31 @@ def mistest():
     return s
 
 
+def mistest_area():
+    """mistest plus a glowing box and a glowing plane. Those aren't NEE'd,
+    so this checks that non-sphere emitters are weighted right."""
+    s = mistest()
+    s.name = "mistest-area"
+    panel = s.mat(EMISSIVE, (3, 3, 3))
+    s.box((1.8, 1.2, -1.2), (0.5, 0.5, 0.5), panel, rot_y=20.0)
+    s.plane((0, 0, 1), -3.0, s.mat(EMISSIVE, (0.2, 0.25, 0.3)))    # glowing back wall
+    return s
+
+
+def cornell_boxes():
+    """Classic Cornell box with two rotated boxes, same layout as scene_boxes.h."""
+    s = cornell()
+    s.name = "cornell-boxes"
+    s.spheres = [sp for sp in s.spheres if s.mats[sp[4]]["type"] == EMISSIVE]   # keep the lamp
+    white = s.mat(DIFFUSE, (0.73, 0.71, 0.68))
+    s.box((-0.33, 0.6, -0.35), (0.58, 1.2, 0.58), white, rot_y=18.0)
+    s.box((0.34, 0.3, 0.3), (0.58, 0.6, 0.58), white, rot_y=-17.0)
+    return s
+
+
 REGISTRY = dict(hero=hero, cornell=cornell, neon=neon, mistest=mistest,
+                **{"mistest-area": mistest_area, "cornell-boxes": cornell_boxes},
                 **{f"furnace-{k}": (lambda k=k: furnace(k)) for k in
-                   ("diffuse", "conductor", "glass", "dispersive", "film", "plastic")})
+                   ("diffuse", "conductor", "glass", "dispersive", "film", "plastic")},
+                **{f"furnace-{k}-box": (lambda k=k: furnace(k, "box")) for k in
+                   ("diffuse", "glass", "film")})

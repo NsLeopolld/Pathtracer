@@ -42,7 +42,8 @@ Flags: `--width --height --spp --depth --out`. Thread count comes from
 ```
 
 Environment setup is [below](#setup-for-the-cuda-version). Scenes: `hero`,
-`cornell`, `neon`, and the test scenes `mistest` and `furnace-*`.
+`cornell`, `cornell-boxes`, `neon`, and the test scenes `mistest`,
+`mistest-area` and `furnace-*`.
 
 ---
 
@@ -99,6 +100,9 @@ sampling), which is what dispersion and thin film need. Also has MIS
 between light and BSDF sampling (power heuristic), GGX metals with Turquin
 energy compensation, coated diffuse, adaptive sampling, AgX tonemapping,
 glare and dithering. The kernel is compiled at runtime with NVRTC.
+Shapes are spheres, planes and boxes, same as the C version (up to 64
+spheres, 8 planes, 16 boxes and 64 lights; `render.py` refuses scenes over
+that).
 
 RGB colours are converted to spectra with a basis from Mallett & Yuksel
 2019, solved with constrained optimisation: three smooth curves that sum to
@@ -118,22 +122,24 @@ wavelength.
 disappear, i.e. every pixel reads 1.0. If it doesn't, energy is being lost
 or added somewhere.
 
-| Material | Result |
-|---|---:|
-| Diffuse | 0.9999 |
-| Glass | 0.9999 |
-| Dispersive glass | 0.9999 |
-| Thin film | 0.9999 |
-| Rough conductor | 0.9999 |
-| Coated diffuse | 0.9790 |
+| Material | Sphere | Box |
+|---|---:|---:|
+| Diffuse | 0.99995 | 0.99996 |
+| Glass | 0.99995 | 0.99993 |
+| Dispersive glass | 0.99983 | |
+| Thin film | 0.99989 | 0.99992 |
+| Rough conductor | 0.99981 | |
+| Coated diffuse | 0.97905 | |
 
 Dispersive glass passing means the hero wavelength reweighting is right.
 Rough conductor was at 0.888 before energy compensation
 (`gpu/ggx_albedo.py`), which is the usual single-scattering GGX loss.
 
 **Estimator agreement.** MIS, NEE only and BSDF only should all converge to
-the same image. They agree within 0.02%, and MIS has the least noise (1.23×
-lower than BSDF only).
+the same image. They agree within 0.01%, and MIS has the least noise (1.29×
+lower than BSDF only). `mistest-area` repeats this with a glowing box and a
+glowing plane added. Those aren't light-sampled, and this test caught a bug
+where their light was dropped or mis-weighted (up to 9% too dark).
 
 **Colour round-trip.** Emitter RGB → spectrum → RGB is off by at most 0.0005.
 
@@ -171,7 +177,7 @@ nothing system-wide. `rm -rf .venv` to undo.
 ```sh
 python3 -m venv --without-pip .venv        # Debian often lacks ensurepip
 python3 -m pip --python .venv/bin/python install \
-    cupy-cuda12x numpy scipy pillow \
+    cupy-cuda12x numpy scipy \
     "nvidia-cuda-nvrtc-cu12==12.4.*" "nvidia-cuda-runtime-cu12==12.4.*" \
     "nvidia-curand-cu12==10.3.5.*" "nvidia-cufft-cu12==11.2.*" \
     "nvidia-cublas-cu12==12.4.*"
@@ -217,9 +223,9 @@ without running the generators first.
 
 ## Known limitations
 
-- **No triangles or meshes.** Spheres, planes and boxes in C; spheres and
-  planes on the GPU. For scenes this small a linear loop over objects is
-  faster than a BVH, so there isn't one.
+- **No triangles or meshes.** Spheres, planes and boxes only. For scenes
+  this small a linear loop over objects is faster than a BVH, so there
+  isn't one.
 - **Caustics are noisy.** Shadow rays can't reach lights through glass, so
   caustics converge slowly. `--clamp` cuts the fireflies but adds bias, so
   it's off by default.

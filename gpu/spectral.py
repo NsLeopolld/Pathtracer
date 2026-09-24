@@ -17,6 +17,7 @@ Wyman-Sloan-Shirley (2013) fits, illuminant is a 6504 K blackbody (close
 enough to D65, no table needed).
 """
 
+import os
 import numpy as np
 from scipy.optimize import minimize
 
@@ -123,6 +124,6 @@ def build():
 if __name__ == "__main__":
     print("building spectral basis...")
     t = build()
-    np.savez("gpu/spectral_tables.npz", **t)
+    np.savez(os.path.join(os.path.dirname(os.path.abspath(__file__)), "spectral_tables.npz"), **t)
     print(f"  wrote gpu/spectral_tables.npz  ({NBINS} bins, "
           f"{LAMBDA_MIN:.0f}-{LAMBDA_MAX:.0f} nm)")

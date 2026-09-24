@@ -16,25 +16,28 @@ print("furnace test (albedo 1, sky 1, expect 1.0)")
 for kind, tol, note in [("diffuse", 0.004, ""), ("glass", 0.004, ""),
                         ("dispersive", 0.006, "hero-wavelength reweighting"),
                         ("film", 0.004, "thin-film R+T=1"),
-                        ("conductor", 0.06, "GGX single-scatter loss expected"),
-                        ("plastic", 0.06, "uncoupled coat loss expected")]:
+                        ("conductor", 0.004, "with Turquin energy compensation"),
+                        ("plastic", 0.06, "uncoupled coat loss expected"),
+                        ("diffuse-box", 0.004, ""), ("glass-box", 0.004, ""),
+                        ("film-box", 0.004, "")]:
     hdr, st = R.render(SC.REGISTRY[f"furnace-{kind}"](), 192, 192, max_spp=512,
                        min_spp=512, chunk=32, adaptive=False, depth=32, quiet=True)
     v = cp.asnumpy(hdr).mean()
     check(f"furnace {kind}", float(v), 1.0, tol, note)
 
-print("\nMIS vs NEE-only vs BSDF-only")
-means = {}
-for mode, label in [(0, "MIS"), (1, "BSDF-sampling only"), (2, "NEE only")]:
-    hdr, st = R.render(SC.mistest(), 256, 144, max_spp=3072, min_spp=3072,
-                       chunk=64, adaptive=False, depth=16, mis_mode=mode, quiet=True)
-    a = cp.asnumpy(hdr)
-    means[label] = a.mean()
-    print(f"    {label:22} mean={a.mean():.5f}  noise={np.abs(np.diff(a,axis=1)).mean():.5f}")
-ref = means["MIS"]
-for k, v in means.items():
-    if k != "MIS":
-        check(f"{k} vs MIS", v/ref, 1.0, 0.02)
+for scene in ("mistest", "mistest-area"):
+    print(f"\nMIS vs NEE-only vs BSDF-only ({scene})")
+    means = {}
+    for mode, label in [(0, "MIS"), (1, "BSDF-sampling only"), (2, "NEE only")]:
+        hdr, st = R.render(SC.REGISTRY[scene](), 256, 144, max_spp=3072, min_spp=3072,
+                           chunk=64, adaptive=False, depth=16, mis_mode=mode, quiet=True)
+        a = cp.asnumpy(hdr)
+        means[label] = a.mean()
+        print(f"    {label:22} mean={a.mean():.5f}  noise={np.abs(np.diff(a,axis=1)).mean():.5f}")
+    ref = means["MIS"]
+    for k, v in means.items():
+        if k != "MIS":
+            check(f"{scene}: {k} vs MIS", v/ref, 1.0, 0.02)
 
 print("\nemitter colour round-trip")
 s = SC.Scene("rt")

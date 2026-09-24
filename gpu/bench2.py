@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Same as bench.py but at equal render time instead of equal spp."""
-import sys, os, time
+import sys, os
 import numpy as np, cupy as cp
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import render as R, scenes as SC

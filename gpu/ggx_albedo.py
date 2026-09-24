@@ -9,6 +9,7 @@ scattering keeps, with F=1. Used for Turquin (2019) compensation:
 
 With VNDF sampling the weight is G2/G1, so E is just its mean.
 """
+import os
 import numpy as np, cupy as cp
 
 NMU, NA, NSAMP = 32, 32, 1 << 18
@@ -70,5 +71,5 @@ if __name__ == "__main__":
     print(f"  range                    = [{E.min():.4f}, {E.max():.4f}]")
     assert E.min() > 0.2 and E.max() <= 1.001, "table out of range"
     assert E[0].mean() > 0.995, "smooth GGX must not lose energy"
-    np.save("gpu/ggx_albedo.npy", E)
+    np.save(os.path.join(os.path.dirname(os.path.abspath(__file__)), "ggx_albedo.npy"), E)
     print(f"  wrote gpu/ggx_albedo.npy  {E.shape}")

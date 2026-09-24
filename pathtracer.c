@@ -575,18 +575,38 @@ static double now_sec(void) {
     return ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
+static void usage(const char *prog, int status) {
+    fprintf(stderr, "usage: %s [--width N] [--height N] [--spp N] [--depth N] [--out file.png]\n"
+                    "  height defaults to width * 9/16\n", prog);
+    exit(status);
+}
+
 int main(int argc, char **argv) {
     int width = 960, height = 0, spp = 144, max_depth = 16;
     const char *out = "render_c.png";
 
-    for (int i = 1; i < argc - 1; i++) {
-        if      (!strcmp(argv[i], "--width"))  width     = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--height")) height    = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--spp"))   spp       = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--depth")) max_depth = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--out"))   out       = argv[++i];
+    for (int i = 1; i < argc; i++) {
+        const char *a = argv[i];
+        if (!strcmp(a, "-h") || !strcmp(a, "--help")) usage(argv[0], 0);
+        if (i + 1 >= argc) {
+            fprintf(stderr, "%s: missing value for %s\n", argv[0], a);
+            usage(argv[0], 2);
+        }
+        if      (!strcmp(a, "--width"))  width     = atoi(argv[++i]);
+        else if (!strcmp(a, "--height")) height    = atoi(argv[++i]);
+        else if (!strcmp(a, "--spp"))    spp       = atoi(argv[++i]);
+        else if (!strcmp(a, "--depth"))  max_depth = atoi(argv[++i]);
+        else if (!strcmp(a, "--out"))    out       = argv[++i];
+        else {
+            fprintf(stderr, "%s: unknown option %s\n", argv[0], a);
+            usage(argv[0], 2);
+        }
     }
     if (height <= 0) height = (int)lrintf(width * 9.0f / 16.0f);
+    if (width <= 0 || height <= 0 || spp <= 0 || max_depth <= 0) {
+        fprintf(stderr, "%s: width, spp and depth must be positive\n", argv[0]);
+        return 2;
+    }
 
     scene_init();
     Vec3 from = v3(CAM_FROM), at = v3(CAM_AT);

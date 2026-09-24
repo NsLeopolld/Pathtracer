@@ -19,6 +19,7 @@
 
 #define MAXS      64
 #define MAXP      8
+#define MAXB      16
 #define MAXLI     64
 
 #define M_DIFFUSE    0
@@ -49,7 +50,9 @@ __constant__ float4       c_pln[MAXP];     // normal.xyz, plane offset
 __constant__ int          c_pmat[MAXP];
 __constant__ int          c_light[MAXLI];  // indices of emissive spheres
 __constant__ float        c_lpow[MAXLI];   // luminance * r^2
-__constant__ int          c_cnt[4];        // nsph, npln, nlight
+__constant__ float4       c_box[2*MAXB];   // (centre.xyz, cos rot_y), (half size.xyz, sin rot_y)
+__constant__ int          c_bmat[MAXB];
+__constant__ int          c_cnt[4];        // nsph, npln, nlight, nbox
 __constant__ float        c_cam[20];
 __constant__ float        c_sky[8];
 __constant__ unsigned int c_sobol[4][32];
@@ -186,10 +189,51 @@ __device__ __forceinline__ float4 sample4(Sampler &s, unsigned int group) {
 }
 
 // ---------------------------------------------------------- intersection
-struct Hit { float t; int prim; int plane; };
+// kind of object a Hit refers to; prim indexes that kind's array
+#define K_SPHERE 0
+#define K_PLANE  1
+#define K_BOX    2
+struct Hit { float t; int prim; int kind; };
+
+// world -> box frame is a rotation by -rot_y around y
+__device__ __forceinline__ V3 box_to_local(int i, V3 v) {
+    float c = c_box[2*i].w, s = c_box[2*i+1].w;
+    return v3(c*v.x - s*v.z, v.y, s*v.x + c*v.z);
+}
+
+// slab test in the box frame; 1e30 on a miss
+__device__ __forceinline__ float box_hit(int i, V3 o, V3 d, float tmin) {
+    float4 a = c_box[2*i], b = c_box[2*i+1];
+    V3 ol = box_to_local(i, sub(o, v3(a.x, a.y, a.z)));
+    V3 dl = box_to_local(i, d);
+    float lo[3] = { -b.x - ol.x, -b.y - ol.y, -b.z - ol.z };
+    float hi[3] = {  b.x - ol.x,  b.y - ol.y,  b.z - ol.z };
+    float dd[3] = { dl.x, dl.y, dl.z };
+    float tn = -1e30f, tf = 1e30f;
+#pragma unroll
+    for (int k = 0; k < 3; k++) {
+        float inv = 1.0f / (fabsf(dd[k]) > 1e-12f ? dd[k] : copysignf(1e-12f, dd[k]));
+        float t1 = lo[k]*inv, t2 = hi[k]*inv;
+        tn = fmaxf(tn, fminf(t1, t2));
+        tf = fminf(tf, fmaxf(t1, t2));
+    }
+    if (tn > tf || tf <= tmin) return 1e30f;
+    return tn > tmin ? tn : tf;            // tf when starting inside
+}
+
+__device__ V3 box_normal(int i, V3 p) {
+    float4 a = c_box[2*i], b = c_box[2*i+1];
+    V3 q = box_to_local(i, sub(p, v3(a.x, a.y, a.z)));
+    float ax = fabsf(q.x)/b.x, ay = fabsf(q.y)/b.y, az = fabsf(q.z)/b.z;
+    V3 n = (ax >= ay && ax >= az) ? v3(copysignf(1.0f, q.x), 0.0f, 0.0f)
+         : (ay >= az)             ? v3(0.0f, copysignf(1.0f, q.y), 0.0f)
+         :                          v3(0.0f, 0.0f, copysignf(1.0f, q.z));
+    float c = a.w, s = b.w;               // back to world: rotate by +rot_y
+    return v3(c*n.x + s*n.z, n.y, -s*n.x + c*n.z);
+}
 
 __device__ bool intersect(V3 o, V3 d, float tmin, Hit &h) {
-    float best = 1e30f; int id = -1, pl = 0;
+    float best = 1e30f; int id = -1, kind = K_SPHERE;
     int ns = c_cnt[0];
     for (int i = 0; i < ns; i++) {
         float4 s = c_sph[i];
@@ -213,14 +257,32 @@ __device__ bool intersect(V3 o, V3 d, float tmin, Hit &h) {
         bool ok = (t > tmin) && (t < best);
         best = ok ? t : best;
         id   = ok ? i : id;
-        pl   = ok ? 1 : pl;
+        kind = ok ? K_PLANE : kind;
     }
-    h.t = best; h.prim = id; h.plane = pl;
+    int nb = c_cnt[3];
+    for (int i = 0; i < nb; i++) {
+        float t = box_hit(i, o, d, tmin);
+        bool ok = t < best;
+        best = ok ? t : best;
+        id   = ok ? i : id;
+        kind = ok ? K_BOX : kind;
+    }
+    h.t = best; h.prim = id; h.kind = kind;
     return id >= 0;
 }
 
 __device__ __forceinline__ int mat_of(const Hit &h) {
-    return h.plane ? c_pmat[h.prim] : c_smat[h.prim];
+    return h.kind == K_PLANE ? c_pmat[h.prim]
+         : h.kind == K_BOX   ? c_bmat[h.prim]
+         :                     c_smat[h.prim];
+}
+
+// unit geometric normal at hit point p (outward for spheres with r > 0)
+__device__ V3 hit_normal(const Hit &h, V3 p) {
+    if (h.kind == K_PLANE) return v3(c_pln[h.prim].x, c_pln[h.prim].y, c_pln[h.prim].z);
+    if (h.kind == K_BOX)   return box_normal(h.prim, p);
+    float4 sp4 = c_sph[h.prim];
+    return norm3(mul(sub(p, v3(sp4.x, sp4.y, sp4.z)), 1.0f/sp4.w));
 }
 
 // ------------------------------------------------------------ materials
@@ -481,14 +543,12 @@ __device__ bool shadow(V3 o, V3 d, int target, const SpecCtx &sc,
     for (int i = 0; i < 6; i++) {
         Hit h;
         if (!intersect(p, d, RAY_EPS, h)) return false;
-        if (!h.plane && h.prim == target) return true;
+        if (h.kind == K_SPHERE && h.prim == target) return true;
         const Material m = mats[mat_of(h)];
         if (m.type != M_THINFILM) return false;
         V3 hp = add(p, mul(d, h.t));
-        V3 n  = mul(sub(hp, v3(c_sph[h.prim].x, c_sph[h.prim].y, c_sph[h.prim].z)),
-                    1.0f/c_sph[h.prim].w);
-        float ci = fabsf(dot3(d, norm3(n)));
-        float th = film_thickness(hp, h.prim, m.film);
+        float ci = fabsf(dot3(d, hit_normal(h, hp)));
+        float th = h.kind == K_SPHERE ? film_thickness(hp, h.prim, m.film) : m.film;
 #pragma unroll
         for (int k = 0; k < NL; k++)
             trans.v[k] *= (1.0f - thinfilm_R(ci, m.ior, th, sc.lam[k]));
@@ -575,14 +635,7 @@ extern "C" __global__ void render(
                 break;
             }
             V3 p = add(o, mul(d, h.t));
-            V3 ng;
-            if (h.plane) {
-                ng = v3(c_pln[h.prim].x, c_pln[h.prim].y, c_pln[h.prim].z);
-            } else {
-                float4 sp4 = c_sph[h.prim];
-                ng = mul(sub(p, v3(sp4.x, sp4.y, sp4.z)), 1.0f/sp4.w);
-            }
-            ng = norm3(ng);
+            V3 ng = hit_normal(h, p);
             int front = dot3(d, ng) < 0.0f;
             V3 fn = front ? ng : neg(ng);
 
@@ -590,9 +643,12 @@ extern "C" __global__ void render(
 
             // ---- emitter ------------------------------------------------
             if (m.type == M_EMISSIVE) {
-                if (mis_mode != 2 || prev_delta) {
+                // Only emissive spheres are NEE'd. Anything else is found by
+                // BSDF sampling alone, so it always counts with weight 1.
+                bool nee_light = h.kind == K_SPHERE;
+                if (mis_mode != 2 || prev_delta || !nee_light) {
                     float w = 1.0f;
-                    if (!prev_delta && mis_mode == 0) {
+                    if (!prev_delta && mis_mode == 0 && nee_light) {
                         float lp = nee_pdf(prev_p, h.prim, nlight);
                         w = power_heuristic(prev_pdf, lp);
                     }
@@ -643,7 +699,8 @@ extern "C" __global__ void render(
             }
             if (m.type == M_THINFILM) {
                 float ci = fminf(dot3(neg(d), fn), 1.0f);
-                float th = film_thickness(p, h.prim, m.film);
+                // thickness varies over spheres (drains to the top); flat elsewhere
+                float th = h.kind == K_SPHERE ? film_thickness(p, h.prim, m.film) : m.film;
                 Spec R;
 #pragma unroll
                 for (int i=0;i<NL;i++) R.v[i] = thinfilm_R(ci, m.ior, th, sc.lam[i]);

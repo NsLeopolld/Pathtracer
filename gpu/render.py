@@ -27,16 +27,27 @@ def _const(mod, name, arr):
     cp.ndarray(arr.shape, dtype=arr.dtype, memptr=ptr)[...] = cp.asarray(arr)
 
 
+# must match MAXS / MAXP / MAXB / MAXLI in kernel.cu
+LIMITS = dict(sph=64, pln=8, bmat=16, lights=64)
+
+
 def upload(mod, scene, width, height):
     p = scene.pack()
+    for key, cap in LIMITS.items():
+        if len(p[key]) > cap:
+            what = dict(sph="spheres", pln="planes", bmat="boxes", lights="lights")[key]
+            raise ValueError(f"scene {scene.name!r} has {len(p[key])} {what}, the kernel "
+                             f"supports {cap} (see MAX* in kernel.cu)")
     _const(mod, "c_sph", p["sph"])
     _const(mod, "c_smat", p["smat"])
     _const(mod, "c_pln", p["pln"])
     _const(mod, "c_pmat", p["pmat"])
+    _const(mod, "c_box", p["box"])
+    _const(mod, "c_bmat", p["bmat"])
     _const(mod, "c_light", p["lights"])
     _const(mod, "c_lpow", p["power"])
     _const(mod, "c_cnt", np.array([len(p["sph"]), len(p["pln"]),
-                                   len(p["lights"]), 0], np.int32))
+                                   len(p["lights"]), len(p["bmat"])], np.int32))
     _const(mod, "c_cam", scene.camera(width / height))
     sky = np.zeros(8, np.float32)
     sky[0:3], sky[3:6] = scene.sky[0], scene.sky[1]
@@ -73,8 +84,8 @@ def render(scene, width, height, max_spp=4096, min_spp=64, chunk=16,
     while active.size:
         n = int(active.size)
         this = chunk if not adaptive else int(min(512, max(chunk, QUANTUM // max(n, 1))))
-        this = min(this, max(1, max_spp - int(counts.min()) if adaptive else this))
-        this = max(this, 1)
+        # active pixels have all been sampled every launch, so they hold the max count
+        this = max(1, min(this, max_spp - int(counts.max())))
         grid = (n + block - 1) // block
         kern((grid,), (block,),
              (active, np.int32(n), accum, counts, mats, tab,
@@ -187,7 +198,7 @@ def save_pfm(hdr, path):
 # --------------------------------------------------------------------- cli
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--scene", default="cornell")
+    ap.add_argument("--scene", default="cornell", choices=sorted(SC.REGISTRY))
     ap.add_argument("--width", type=int, default=960)
     ap.add_argument("--height", type=int, default=0)
     ap.add_argument("--spp", type=int, default=4096)

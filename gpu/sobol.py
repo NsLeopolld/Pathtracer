@@ -5,6 +5,7 @@ new-joe-kuo-6.21201), plus checks for stratification and the (0,m,2)-net
 property. A wrong recurrence fails the net check.
 """
 
+import os
 import numpy as np
 
 # (s, a, m) per dimension. Dimension 0 is the van der Corput sequence.
@@ -93,5 +94,5 @@ if __name__ == "__main__":
     print("verifying Sobol direction numbers...")
     assert check(), "Sobol generation is wrong"
     D = np.stack([directions(d) for d in range(4)])
-    np.save("gpu/sobol_directions.npy", D)
+    np.save(os.path.join(os.path.dirname(os.path.abspath(__file__)), "sobol_directions.npy"), D)
     print(f"  wrote gpu/sobol_directions.npy  {D.shape} uint32")
