@@ -1,6 +1,7 @@
 /*
- * CPU path tracer. Spheres only, NEE toward sphere lights, Schlick glass,
- * fuzzy metal, thin lens DOF, Russian roulette, ACES, own PNG writer.
+ * CPU path tracer. Spheres, planes and boxes (rotatable around y). NEE
+ * toward sphere lights, Schlick glass, fuzzy metal, thin lens DOF, Russian
+ * roulette, ACES, own PNG writer.
  *
  * One path at a time per thread (OpenMP). Sphere data is SoA and the
  * intersection loop is written so gcc vectorizes it (AVX2 with
@@ -20,10 +21,31 @@
 #include <omp.h>
 #endif
 
+/* scene headers (written by make_scenes.py) fill in arrays of these */
+typedef enum { LAMBERTIAN=0, METAL=1, DIELECTRIC=2, EMISSIVE=3 } Mat;
+typedef struct { float cx, cy, cz, r; float ar, ag, ab; int mat; float param; } Sphere;
+typedef struct { float nx, ny, nz, d; float ar, ag, ab; int mat; float param; } Plane; /* n.p = d */
+typedef struct { float cx, cy, cz, sx, sy, sz, rot_y;   /* centre, full size, degrees */
+                 float ar, ag, ab; int mat; float param; } Box;
+
 #ifndef SCENE_FILE
 #define SCENE_FILE "scene.h"
 #endif
 #include SCENE_FILE
+
+#ifndef N_PLANES
+#define N_PLANES 0
+#endif
+#ifndef N_BOXES
+#define N_BOXES 0
+#endif
+
+/* Every object gets one id for material lookups: planes first, then
+ * spheres, then boxes. With no planes a sphere's id is its index. */
+#define N_OBJ     (N_PLANES + N_SPHERES + N_BOXES)
+#define SPH_ID(i) (N_PLANES + (i))
+#define BOX_ID(i) (N_PLANES + N_SPHERES + (i))
+#define ARR(n)    ((n) > 0 ? (n) : 1)      /* avoid zero-length arrays */
 
 /* defaults, scene headers can override any of these */
 #ifndef CAM_FROM
@@ -45,7 +67,7 @@
 #define SKY_ZENITH    0.10f, 0.16f, 0.30f
 #endif
 #ifndef FLOOR_CHECKER
-#define FLOOR_CHECKER 1          /* checker on sphere 0 */
+#define FLOOR_CHECKER 1          /* checker on object 0 (first plane, else first sphere) */
 #endif
 #ifndef EXPOSURE
 #define EXPOSURE      1.0f
@@ -114,35 +136,114 @@ static inline Vec3 random_unit(Rng *r) {
 #define LANES 8
 #define N_PAD (((N_SPHERES) + LANES - 1) / LANES * LANES)
 
-static float g_cx[N_PAD] __attribute__((aligned(32)));
-static float g_cy[N_PAD] __attribute__((aligned(32)));
-static float g_cz[N_PAD] __attribute__((aligned(32)));
-static float g_r2[N_PAD] __attribute__((aligned(32)));
-static float g_r[N_SPHERES], g_inv_r[N_SPHERES];
-static float g_ar[N_SPHERES], g_ag[N_SPHERES], g_ab[N_SPHERES];
-static int   g_mat[N_SPHERES];
-static float g_param[N_SPHERES];
-static int   g_lights[N_SPHERES], g_nlights = 0;
-static float g_power[N_SPHERES];   /* luminance * r^2, rough light power */
+/* sphere geometry, indexed by sphere */
+static float g_cx[ARR(N_PAD)] __attribute__((aligned(32)));
+static float g_cy[ARR(N_PAD)] __attribute__((aligned(32)));
+static float g_cz[ARR(N_PAD)] __attribute__((aligned(32)));
+static float g_r2[ARR(N_PAD)] __attribute__((aligned(32)));
+static float g_r[ARR(N_SPHERES)], g_inv_r[ARR(N_SPHERES)];
+static int   g_lights[ARR(N_SPHERES)], g_nlights = 0;   /* emissive spheres */
+static float g_power[ARR(N_SPHERES)];   /* luminance * r^2, rough light power */
+
+/* plane and box geometry */
+#if N_PLANES > 0
+static Vec3  g_pn[N_PLANES];            /* unit normal */
+static float g_pd[N_PLANES];
+#endif
+#if N_BOXES > 0
+static Vec3  g_bc[N_BOXES], g_bh[N_BOXES];             /* centre, half size */
+static float g_bcos[N_BOXES], g_bsin[N_BOXES];
+#endif
+
+/* materials, indexed by object id */
+static float g_ar[ARR(N_OBJ)], g_ag[ARR(N_OBJ)], g_ab[ARR(N_OBJ)];
+static int   g_mat[ARR(N_OBJ)];
+static float g_param[ARR(N_OBJ)];
+
+static void set_mat(int id, float r, float g, float b, int mat, float param) {
+    g_ar[id] = r; g_ag[id] = g; g_ab[id] = b;
+    g_mat[id] = mat; g_param[id] = param;
+}
 
 static void scene_init(void) {
+#if N_SPHERES > 0
     for (int i = 0; i < N_SPHERES; i++) {
         const Sphere *s = &SCENE[i];
         g_cx[i] = s->cx; g_cy[i] = s->cy; g_cz[i] = s->cz;
         g_r[i]  = s->r;  g_r2[i] = s->r * s->r; g_inv_r[i] = 1.0f / s->r;
-        g_ar[i] = s->ar; g_ag[i] = s->ag; g_ab[i] = s->ab;
-        g_mat[i] = s->mat; g_param[i] = s->param;
+        set_mat(SPH_ID(i), s->ar, s->ag, s->ab, s->mat, s->param);
         g_power[i] = (0.2126f*s->ar + 0.7152f*s->ag + 0.0722f*s->ab) * s->r * s->r;
         if (s->mat == EMISSIVE) g_lights[g_nlights++] = i;
     }
+#endif
     /* r^2 = -1e30 makes disc hugely negative, so padding never hits */
     for (int i = N_SPHERES; i < N_PAD; i++) {
         g_cx[i] = g_cy[i] = g_cz[i] = 0.0f;
         g_r2[i] = -1e30f;
     }
+#if N_PLANES > 0
+    for (int i = 0; i < N_PLANES; i++) {
+        const Plane *pl = &PLANES[i];
+        float len = sqrtf(pl->nx*pl->nx + pl->ny*pl->ny + pl->nz*pl->nz);
+        g_pn[i] = v3(pl->nx/len, pl->ny/len, pl->nz/len);
+        g_pd[i] = pl->d / len;
+        set_mat(i, pl->ar, pl->ag, pl->ab, pl->mat, pl->param);
+    }
+#endif
+#if N_BOXES > 0
+    for (int i = 0; i < N_BOXES; i++) {
+        const Box *b = &BOXES[i];
+        g_bc[i] = v3(b->cx, b->cy, b->cz);
+        g_bh[i] = v3(0.5f*b->sx, 0.5f*b->sy, 0.5f*b->sz);
+        g_bcos[i] = cosf(b->rot_y * PI / 180.0f);
+        g_bsin[i] = sinf(b->rot_y * PI / 180.0f);
+        set_mat(BOX_ID(i), b->ar, b->ag, b->ab, b->mat, b->param);
+    }
+#endif
 }
 
-/* Closest hit. gcc won't vectorize a min-with-index reduction, so keep a
+#if N_BOXES > 0
+/* ---- boxes: slab test in the box's own (unrotated) frame ---- */
+
+/* world -> box frame is a rotation by -rot_y around y */
+static inline Vec3 box_to_local(int b, Vec3 v) {
+    float c = g_bcos[b], s = g_bsin[b];
+    return v3(c*v.x - s*v.z, v.y, s*v.x + c*v.z);
+}
+
+static inline float box_hit(int b, Vec3 o, Vec3 d, float tmin) {
+    Vec3 ol = box_to_local(b, vsub(o, g_bc[b]));
+    Vec3 dl = box_to_local(b, d);
+    Vec3 h  = g_bh[b];
+    float lo[3] = { -h.x - ol.x, -h.y - ol.y, -h.z - ol.z };
+    float hi[3] = {  h.x - ol.x,  h.y - ol.y,  h.z - ol.z };
+    float dd[3] = { dl.x, dl.y, dl.z };
+    float tn = -1e30f, tf = 1e30f;
+    for (int a = 0; a < 3; a++) {
+        /* keep 1/d finite: -ffast-math assumes no infinities */
+        float inv = 1.0f / (fabsf(dd[a]) > 1e-12f ? dd[a] : copysignf(1e-12f, dd[a]));
+        float t1 = lo[a] * inv, t2 = hi[a] * inv;
+        tn = fmaxf(tn, fminf(t1, t2));
+        tf = fminf(tf, fmaxf(t1, t2));
+    }
+    if (tn > tf || tf <= tmin) return 1e30f;
+    return tn > tmin ? tn : tf;          /* tf when the ray starts inside */
+}
+
+static inline Vec3 box_normal(int b, Vec3 p) {
+    Vec3 q = box_to_local(b, vsub(p, g_bc[b]));
+    Vec3 h = g_bh[b];
+    /* the face we're on is the axis where |q| is closest to the half size */
+    float ax = fabsf(q.x) / h.x, ay = fabsf(q.y) / h.y, az = fabsf(q.z) / h.z;
+    Vec3 n = (ax >= ay && ax >= az) ? v3(copysignf(1.0f, q.x), 0.0f, 0.0f)
+           : (ay >= az)             ? v3(0.0f, copysignf(1.0f, q.y), 0.0f)
+           :                          v3(0.0f, 0.0f, copysignf(1.0f, q.z));
+    float c = g_bcos[b], s = g_bsin[b];  /* back to world: rotate by +rot_y */
+    return v3(c*n.x + s*n.z, n.y, -s*n.x + c*n.z);
+}
+#endif
+
+/* Closest hit, returns an object id. gcc won't vectorize a min-with-index reduction, so keep a
  * separate best hit per lane and merge them at the end. The inner loop
  * has to stay branchless or it stops vectorizing. */
 static inline int intersect(Vec3 o, Vec3 d, float tmin, float *out_t) {
@@ -175,8 +276,37 @@ static inline int intersect(Vec3 o, Vec3 d, float tmin, float *out_t) {
             bi = id[j];
         }
     }
+    int hit = bi >= 0 ? SPH_ID(bi) : -1;
+
+    /* planes and boxes are few, plain loops are fine */
+#if N_PLANES > 0
+    for (int i = 0; i < N_PLANES; i++) {
+        float den = vdot(g_pn[i], d);
+        if (fabsf(den) < 1e-9f) continue;
+        float t = (g_pd[i] - vdot(g_pn[i], o)) / den;
+        if (t > tmin && t < bt) { bt = t; hit = i; }
+    }
+#endif
+#if N_BOXES > 0
+    for (int i = 0; i < N_BOXES; i++) {
+        float t = box_hit(i, o, d, tmin);
+        if (t < bt) { bt = t; hit = BOX_ID(i); }
+    }
+#endif
     *out_t = bt;
-    return bi;
+    return hit;
+}
+
+static inline Vec3 normal_at(int id, Vec3 p) {
+#if N_PLANES > 0
+    if (id < N_PLANES) return g_pn[id];
+#endif
+#if N_BOXES > 0
+    if (id >= BOX_ID(0)) return box_normal(id - BOX_ID(0), p);
+#endif
+    /* sphere; signed radius -> inward normals for a hollow shell */
+    int i = id - N_PLANES;
+    return vscl(vsub(p, v3(g_cx[i], g_cy[i], g_cz[i])), g_inv_r[i]);
 }
 
 static inline Vec3 sky(Vec3 d) {
@@ -199,10 +329,11 @@ static inline Vec3 checker(Vec3 p) {
 
 static Vec3 sample_lights(Vec3 p, Vec3 n, Vec3 albedo, Rng *rng) {
     const Vec3 zero = v3(0.0f, 0.0f, 0.0f);
-    if (g_nlights == 0) return zero;
+    int nl = g_nlights;
+    if (nl == 0) return zero;
 
-    float cdf[N_SPHERES], total = 0.0f;
-    for (int k = 0; k < g_nlights; k++) {
+    float cdf[ARR(N_SPHERES)] = {0}, total = 0.0f;
+    for (int k = 0; k < nl; k++) {
         int j = g_lights[k];
         float dx = g_cx[j]-p.x, dy = g_cy[j]-p.y, dz = g_cz[j]-p.z;
         total += g_power[j] / fmaxf(dx*dx + dy*dy + dz*dz, g_r2[j]);
@@ -210,8 +341,9 @@ static Vec3 sample_lights(Vec3 p, Vec3 n, Vec3 albedo, Rng *rng) {
     }
     float pick = randf(rng) * total;
     int k = 0;
-    while (k < g_nlights - 1 && cdf[k] < pick) k++;
-    float pick_pdf = (cdf[k] - (k ? cdf[k-1] : 0.0f)) / total;
+    float lo = 0.0f;                    /* cdf value before light k */
+    while (k < nl - 1 && cdf[k] < pick) lo = cdf[k++];
+    float pick_pdf = (cdf[k] - lo) / total;
     int li = g_lights[k];
     Vec3 to = vsub(v3(g_cx[li], g_cy[li], g_cz[li]), p);
     float dist2 = vlen2(to), dist = sqrtf(dist2);
@@ -235,11 +367,12 @@ static Vec3 sample_lights(Vec3 p, Vec3 n, Vec3 albedo, Rng *rng) {
     /* visible iff the first hit is the light we picked */
     float t;
     Vec3 org = vadd(p, vscl(n, RAY_EPS));
-    if (intersect(org, ldir, 1e-4f, &t) != li) return zero;
+    if (intersect(org, ldir, 1e-4f, &t) != SPH_ID(li)) return zero;
 
     float pdf = 1.0f / (2.0f * PI * fmaxf(1.0f - cos_max, 1e-9f));
     float wgt = cs / (PI * pdf * pick_pdf);            /* brdf = alb/pi */
-    return vscl(vmul(albedo, v3(g_ar[li], g_ag[li], g_ab[li])), wgt);
+    int lid = SPH_ID(li);
+    return vscl(vmul(albedo, v3(g_ar[lid], g_ag[lid], g_ab[lid])), wgt);
 }
 
 /* ---- path tracing ---- */
@@ -254,8 +387,7 @@ static Vec3 trace(Vec3 o, Vec3 d, Rng *rng, int max_depth) {
         if (id < 0) { L = vadd(L, vmul(T, sky(d))); break; }
 
         Vec3 p = vadd(o, vscl(d, t));
-        /* signed radius -> inward normals for the hollow shell */
-        Vec3 nrm = vscl(vsub(p, v3(g_cx[id], g_cy[id], g_cz[id])), g_inv_r[id]);
+        Vec3 nrm = normal_at(id, p);
         int front = vdot(d, nrm) < 0.0f;
         Vec3 fn = front ? nrm : vneg(nrm);
 
@@ -263,7 +395,9 @@ static Vec3 trace(Vec3 o, Vec3 d, Rng *rng, int max_depth) {
         Vec3 alb = (FLOOR_CHECKER && id == 0) ? checker(p) : v3(g_ar[id], g_ag[id], g_ab[id]);
 
         if (mat == EMISSIVE) {
-            if (specular) L = vadd(L, vmul(T, alb));
+            /* only emissive spheres are NEE'd, so other emitters always count */
+            int is_sphere = id >= N_PLANES && id < BOX_ID(0);
+            if (specular || !is_sphere) L = vadd(L, vmul(T, alb));
             break;
         }
 
@@ -463,8 +597,8 @@ int main(int argc, char **argv) {
 #ifdef _OPENMP
     threads = omp_get_max_threads();
 #endif
-    fprintf(stderr, "  %dx%d  %d spp  depth %d  %d threads  %d spheres\n",
-            width, height, spp, max_depth, threads, N_SPHERES);
+    fprintf(stderr, "  %dx%d  %d spp  depth %d  %d threads  %d objects\n",
+            width, height, spp, max_depth, threads, N_OBJ);
 
     float *acc = malloc(sizeof(float) * 3 * (size_t)width * (size_t)height);
     double t0 = now_sec();

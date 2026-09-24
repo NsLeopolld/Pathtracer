@@ -2,10 +2,6 @@
 #ifndef SCENE_H
 #define SCENE_H
 
-typedef enum { LAMBERTIAN=0, METAL=1, DIELECTRIC=2, EMISSIVE=3 } Mat;
-
-typedef struct { float cx, cy, cz, r; float ar, ag, ab; int mat; float param; } Sphere;
-
 #define N_SPHERES 42
 
 static const Sphere SCENE[N_SPHERES] = {

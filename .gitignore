@@ -1,7 +1,6 @@
 # binaries (build commands are in the README)
 pathtracer
-pathtracer_cornell
-pathtracer_neon
+pathtracer_*
 *.o
 
 # Python

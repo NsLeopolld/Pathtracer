@@ -2,10 +2,6 @@
 #ifndef SCENE_H
 #define SCENE_H
 
-typedef enum { LAMBERTIAN=0, METAL=1, DIELECTRIC=2, EMISSIVE=3 } Mat;
-
-typedef struct { float cx, cy, cz, r; float ar, ag, ab; int mat; float param; } Sphere;
-
 #define CAM_FROM       0.0f, 1.1f, 7.5f
 #define CAM_AT         0.0f, 0.9f, 0.0f
 #define CAM_VFOV       28.0f
@@ -16,7 +12,6 @@ typedef struct { float cx, cy, cz, r; float ar, ag, ab; int mat; float param; } 
 #define EXPOSURE       1.0f
 
 #define N_SPHERES 45
-
 static const Sphere SCENE[N_SPHERES] = {
   { 0.000000f, -1000.000000f, 0.000000f, 1000.000000f, 0.050000f, 0.050000f, 0.060000f, LAMBERTIAN, 0.000000f },
   { 0.000000f, 1.000000f, 0.000000f, 1.000000f, 1.000000f, 1.000000f, 1.000000f, DIELECTRIC, 1.500000f },
